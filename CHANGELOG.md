@@ -1,10 +1,20 @@
 # Changelog
 
-## 0.56.2 — Unreleased
+## 0.56.2 — 2026-08-31
+
+### Performance
+- Local costs: reduce background CPU spent parsing native session timestamps and validating appended Codex history, preserving timestamp precision, daily totals, and fork accounting.
+- Codex: reduce repeated decoding of cached cost history during scans, while preserving stored totals and checking for database and filesystem changes.
+- Claude and Vertex AI: reduce CPU spent reading local transcript metadata, preserving provider detection, Unicode handling, and token/cost totals.
 
 ### Fixed
+- Local costs: preserve token breakdowns, reasoning, request counts, and pricing coverage when combining reports or reopening cached history. Thanks @Pjhhhhh!
 - Codex: recover cost-history catch-up when removed fork files leave abandoned parent discovery in an existing cache, preserving stored totals and unresolved-fork accounting (partial fix for #2815). Thanks @xiehaibin18!
+- Codex: preserve pending weekly-reset evidence through credits-only refreshes so eligible low-usage confirmations survive relaunch (partial fix for #3248). Thanks @kcharlan!
+- Charts: keep endpoint dates readable in token/cost, credit-usage, credits-history, and plan-history submenus (partial fix for #3209). Thanks @vinschger!
+- Agent sessions: stop Codex metadata enrichment and Pi/OMP path resolution when the scan budget expires, and honor the same deadline during Claude Desktop root discovery.
 - OpenCode Go: omit misleading pace and run-out advice for locally estimated quotas while preserving percentages, resets, and cost history (partial fix for #3286). Thanks @Akagilnc!
+- OpenRouter: open Activity from Usage Dashboard instead of credit settings (#3290). Thanks @akshayprabhu200!
 
 ## 0.56.1 — 2026-08-30
 

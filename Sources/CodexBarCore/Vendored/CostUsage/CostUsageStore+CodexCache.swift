@@ -47,6 +47,7 @@ extension CostUsageStore {
     static let defaultFileBudgetBytes: Int64 = 256 * 1024 * 1024
 
     func loadCodexCache(calendar: Calendar) -> CostUsageCache {
+        self.retainedCodexBaseline = nil
         _ = self.removeLegacyCodexArtifactIfPresent()
         let snapshot = self.readSnapshot()
         guard snapshot.metadata.timeZoneIdentifier == nil
@@ -56,6 +57,7 @@ extension CostUsageStore {
     }
 
     func loadCodexReadView(calendar: Calendar, purpose: CostUsageStoreReadPurpose) -> CostUsageStoreReadView {
+        self.retainedCodexBaseline = nil
         _ = self.removeLegacyCodexArtifactIfPresent()
         return self.withDatabase(default: CostUsageStoreReadView(cache: CostUsageCache())) { database in
             let recorder = self.scopedReadWorkRecorderForTesting
@@ -97,23 +99,24 @@ extension CostUsageStore {
         reportWindow: (sinceKey: String, untilKey: String)? = nil,
         rowBudget: Int = CostUsageStore.defaultRowBudget,
         fileBudgetBytes: Int64 = CostUsageStore.defaultFileBudgetBytes,
-        skipIdenticalContent: Bool = false) -> CostUsageStoreBudgetResult
+        unloadedTokenSnapshotPaths: Set<String> = [],
+        unloadedUsageRowPaths: Set<String> = [],
+        skipIdenticalContent: Bool = false,
+        receipt: CodexBaselineReceipt? = nil) -> CostUsageStoreBudgetResult
     {
+        guard let baseline = self.takeCodexBaseline(receipt), self.codexBaselineIsCurrent(baseline) else {
+            return Self.rescanRequired()
+        }
         var cache = cache
         Self.reconcileCompletedCodexCatchUp(cache: &cache)
-        let previous = self.readSnapshot()
+        let previous = baseline.persistence
         let budgetProtectionWindow = Self.budgetProtectionWindow(
             cache: cache,
             requestedScanWindow: requestedScanWindow)
         if skipIdenticalContent,
-           Self.persistedContentMatches(
-               previous: previous,
-               cache: cache,
-               calendar: calendar,
-               recorder: self.scopedReadWorkRecorderForTesting)
+           Self.persistedContentMatches(baseline: baseline, cache: cache, calendar: calendar)
         {
-            // Retention owns the safety boundary: even a semantically unchanged scanner result
-            // must honor newly tightened row/file budgets before it can return.
+            // Retention owns the safety boundary even when the scanner's content is unchanged.
             let result = self.enforceBudgets(
                 maxRows: rowBudget,
                 maxFileBytes: fileBudgetBytes,
@@ -121,67 +124,40 @@ extension CostUsageStore {
                 requestedUntilDay: budgetProtectionWindow.untilKey,
                 calendar: calendar)
             guard !result.catchUpRequired else { return result }
-            if let checkpoint = Self.identicalContentPreLockCheckpointForTesting,
-               checkpoint.databaseURL == self.databaseURL
-            {
-                checkpoint.checkpoint()
-            }
-            guard self.beginSaveTransaction() else {
-                var retry = result
-                retry.catchUpRequired = true
-                return retry
-            }
+            self.codexSavePreLockCheckpoint()
+            guard self.beginSaveTransaction() else { return Self.rescanRequired(result) }
 
-            // Another process may have committed a full save after the optimistic comparison.
-            // Recheck the complete semantic snapshot under this writer lock. A mismatch means
-            // this scanner's cache is stale, so preserve the newer store and request a rescan.
-            let lockedPrevious = self.readSnapshotInCurrentTransaction()
-            guard Self.persistedContentMatches(
-                previous: lockedPrevious,
-                cache: cache,
-                calendar: calendar,
-                recorder: self.scopedReadWorkRecorderForTesting)
+            // Revalidate after retention and under the writer lock. External changes must never
+            // authorize a comparison or rewrite against this scanner's stale decoded baseline.
+            guard let locked = self.codexBaselineAfterRetention(baseline),
+                  Self.persistedContentMatches(baseline: locked, cache: cache, calendar: calendar),
+                  self.codexBaselineIsCurrent(locked)
             else {
                 _ = self.rollbackSaveTransaction()
-                var retry = result
-                retry.catchUpRequired = true
-                return retry
+                return Self.rescanRequired(result)
             }
-
-            // The sqlite cursor is excluded from content identity so a steadily advancing
-            // lastRowID cannot force a full rewrite. Persist it here as a metadata-only
-            // update inside the same writer transaction.
-            guard self.persistPriorityTurnsCursorIfChanged(previous: lockedPrevious, cache: cache) else {
+            guard self.persistPriorityTurnsCursorIfChanged(previous: locked, cache: cache) else {
                 _ = self.rollbackSaveTransaction()
-                var retry = result
-                retry.catchUpRequired = true
-                return retry
+                return Self.rescanRequired(result)
             }
-
-            let advanced = self.advanceLastScanUnixMsInCurrentTransaction(cache.lastScanUnixMs)
-            let committed = self.endSaveTransaction()
-            guard advanced, committed else {
-                var retry = result
-                retry.catchUpRequired = true
-                return retry
+            guard self.advanceLastScanUnixMsInCurrentTransaction(cache.lastScanUnixMs) else {
+                _ = self.rollbackSaveTransaction()
+                return Self.rescanRequired(result)
             }
+            guard self.endSaveTransaction() else { return Self.rescanRequired(result) }
             return result
         }
         let canReuseStoredRows = previous.metadata.timeZoneIdentifier == calendar.timeZone.identifier
         let previousFilesByPath = Dictionary(uniqueKeysWithValues: previous.files.map { ($0.path, $0) })
-        let snapshotCountsByPath = previous.tokenSnapshots
-            .reduce(into: [String: Int]()) { $0[$1.path, default: 0] += 1 }
-        let rowCountsByPath = previous.usageRows.reduce(into: [String: Int]()) { $0[$1.path, default: 0] += 1 }
-        // One transaction spans every table the save cycle touches, so a crash or failure
-        // midway can never leave e.g. files upserted while day_aggregates stay stale.
-        // Budget enforcement below runs outside: it checkpoints the WAL and vacuums, which
-        // SQLite forbids inside an open transaction.
-        guard self.beginSaveTransaction() else {
-            return CostUsageStoreBudgetResult(
-                deletedRows: 0,
-                rowCount: previous.files.count,
-                fileBytes: 0,
-                catchUpRequired: true)
+        let retry = CostUsageStoreBudgetResult(
+            deletedRows: 0, rowCount: previous.files.count, fileBytes: 0, catchUpRequired: true)
+        // No transaction spans the JSONL scan. Changed saves must validate their original
+        // baseline under the lock too, before deleting files or reusing persisted row prefixes.
+        self.codexSavePreLockCheckpoint()
+        guard self.beginSaveTransaction() else { return retry }
+        guard self.codexBaselineIsCurrent(baseline) else {
+            _ = self.rollbackSaveTransaction()
+            return retry
         }
         self.deleteRemovedFiles(previous: previous, cache: cache)
         var persistedFiles = 0
@@ -191,25 +167,26 @@ extension CostUsageStore {
                 usage: usage,
                 baseline: PersistedFileBaseline(
                     file: previousFilesByPath[path],
-                    snapshotCount: snapshotCountsByPath[path] ?? 0,
-                    rowCount: rowCountsByPath[path] ?? 0,
+                    snapshotCount: previous.snapshotCounts[path] ?? 0,
+                    rowCount: previous.rowCounts[path] ?? 0,
+                    tokenSnapshotsLoaded: !unloadedTokenSnapshotPaths.contains(path),
+                    usageRowsLoaded: !unloadedUsageRowPaths.contains(path),
+                    nextUsageRowIndex: previousFilesByPath[path]?.scanState.nextUsageRowIndex,
                     canReuseRows: canReuseStoredRows),
                 calendar: calendar)
             persistedFiles += 1
             Self.saveCycleCheckpointForTesting?(persistedFiles)
         }
         _ = self.replaceDayAggregates(Self.globalAggregates(
-            cache: cache, recorder: self.scopedReadWorkRecorderForTesting))
+            cache: cache,
+            persistedFileAggregates: previous.fileDayAggregates,
+            unloadedUsageRowPaths: unloadedUsageRowPaths,
+            recorder: self.scopedReadWorkRecorderForTesting))
         _ = self.setMetadata(Self.metadata(cache: cache, calendar: calendar))
         _ = self.setDiscoveryState(Self.discoveryState(cache.codexSessionDiscovery))
         _ = self.setLookbackState(Self.lookbackState(cache.codexActiveLookbackState))
-        guard self.endSaveTransaction() else {
-            return CostUsageStoreBudgetResult(
-                deletedRows: 0,
-                rowCount: previous.files.count,
-                fileBytes: 0,
-                catchUpRequired: true)
-        }
+        guard self.endSaveTransaction() else { return retry }
+        // Checkpointing and vacuuming must remain outside the save transaction.
         let result = self.enforceBudgets(
             maxRows: rowBudget,
             maxFileBytes: fileBudgetBytes,
@@ -226,9 +203,27 @@ extension CostUsageStore {
         return result
     }
 
+    private static func rescanRequired(
+        _ result: CostUsageStoreBudgetResult = .init(deletedRows: 0, rowCount: 0, fileBytes: 0))
+        -> CostUsageStoreBudgetResult
+    {
+        var result = result
+        result.catchUpRequired = true
+        return result
+    }
+
+    private func codexSavePreLockCheckpoint() {
+        if let checkpoint = Self.identicalContentPreLockCheckpointForTesting,
+           checkpoint.databaseURL == self.databaseURL
+        {
+            checkpoint.checkpoint()
+        }
+    }
+
     /// True when persisting `cache` would leave every content table semantically unchanged.
-    /// This is O(persisted cache rows): it reconstructs typed values already read from SQLite
-    /// and compares them in memory; it never parses timestamps or opens session JSONL files. The
+    /// This is O(persisted summary rows plus histories loaded for this scanner pass): it
+    /// reuses typed decoding and reruns current filesystem/anchor reconciliation; it never
+    /// parses timestamps or opens session JSONL files. The
     /// persisted spellings of a few optional fields differ from their in-memory forms
     /// (`catchUpPending` and `codexScanComplete` store nil as false/true, `timeZoneIdentifier`
     /// is fixed by the caller's calendar, and `lastScanUnixMs` is a wall-clock stamp), so
@@ -236,12 +231,11 @@ extension CostUsageStore {
     /// here: it advances independently of usage content and is written as a metadata-only
     /// update on the skip path.
     private static func persistedContentMatches(
-        previous: CostUsageStoreSnapshot,
+        baseline: CodexDecodedBaseline,
         cache: CostUsageCache,
-        calendar: Calendar,
-        recorder: CostUsageStoreReadWorkRecorder?) -> Bool
+        calendar: Calendar) -> Bool
     {
-        var restored = Self.cache(from: previous, recorder: recorder)
+        var restored = Self.reconciledCodexCache(baseline.decoded, persistence: baseline.persistence)
         guard restored.timeZoneIdentifier == nil
             || restored.timeZoneIdentifier == calendar.timeZone.identifier
         else { return false }
@@ -264,14 +258,14 @@ extension CostUsageStore {
     /// Writes only `scan_metadata.priorityTurnStatePayload` when the sqlite cursor advanced.
     /// Caller already owns the save transaction.
     private func persistPriorityTurnsCursorIfChanged(
-        previous: CostUsageStoreSnapshot,
+        previous: CodexDecodedBaseline,
         cache: CostUsageCache) -> Bool
     {
-        guard Self.persistedPriorityTurnsCursor(previous) != cache.codexPriorityTurnsCursor else {
+        guard previous.decoded.codexPriorityTurnsCursor != cache.codexPriorityTurnsCursor else {
             return true
         }
         guard let payload = Self.priorityTurnStatePayload(cache: cache) else { return false }
-        var metadata = previous.metadata
+        var metadata = previous.persistence.metadata
         metadata.priorityTurnStatePayload = payload
         return self.setMetadata(metadata)
     }
@@ -308,6 +302,7 @@ extension CostUsageStore {
         var costCacheComplete: Bool?
         var session: CostUsageCodexSessionMetadata?
         var workspaceFingerprint: String?
+        var turnIDs: [String]?
         var hasRows: Bool
         var hasTurnIDs: Bool
         var hasTokenSnapshots: Bool
@@ -358,6 +353,9 @@ extension CostUsageStore {
         var file: CostUsageStoreFile?
         var snapshotCount: Int
         var rowCount: Int
+        var tokenSnapshotsLoaded: Bool
+        var usageRowsLoaded: Bool
+        var nextUsageRowIndex: Int?
         var canReuseRows: Bool
     }
 
@@ -375,7 +373,35 @@ extension CostUsageStore {
     private static func cache(
         from snapshot: CostUsageStoreSnapshot,
         recorder: CostUsageStoreReadWorkRecorder?,
-        retryPresence: [String: CostUsageCodexRetryBufferPresence]? = nil) -> CostUsageCache
+        retryPresence: [String: CostUsageCodexRetryBufferPresence]? = nil,
+        loadedTokenSnapshotPaths: Set<String>? = nil,
+        loadedUsageRowPaths: Set<String>? = nil,
+        unloadedTokenSnapshotPathRecorder: ((String) -> Void)? = nil,
+        unloadedUsageRowPathRecorder: ((String) -> Void)? = nil,
+        legacyTurnIDSummaryPathRecorder: ((String) -> Void)? = nil) -> CostUsageCache
+    {
+        self.reconciledCodexCache(
+            self.decodeCodexCache(
+                from: snapshot,
+                recorder: recorder,
+                retryPresence: retryPresence,
+                loadedTokenSnapshotPaths: loadedTokenSnapshotPaths,
+                loadedUsageRowPaths: loadedUsageRowPaths,
+                unloadedTokenSnapshotPathRecorder: unloadedTokenSnapshotPathRecorder,
+                unloadedUsageRowPathRecorder: unloadedUsageRowPathRecorder,
+                legacyTurnIDSummaryPathRecorder: legacyTurnIDSummaryPathRecorder),
+            persistence: CodexPersistenceState(snapshot: snapshot))
+    }
+
+    static func decodeCodexCache(
+        from snapshot: CostUsageStoreSnapshot,
+        recorder: CostUsageStoreReadWorkRecorder?,
+        retryPresence: [String: CostUsageCodexRetryBufferPresence]? = nil,
+        loadedTokenSnapshotPaths: Set<String>? = nil,
+        loadedUsageRowPaths: Set<String>? = nil,
+        unloadedTokenSnapshotPathRecorder: ((String) -> Void)? = nil,
+        unloadedUsageRowPathRecorder: ((String) -> Void)? = nil,
+        legacyTurnIDSummaryPathRecorder: ((String) -> Void)? = nil) -> CostUsageCache
     {
         recorder?.recordCacheConversion()
         var cache = CostUsageCache()
@@ -413,53 +439,33 @@ extension CostUsageStore {
         let lineageByPath = Dictionary(uniqueKeysWithValues: snapshot.forkLineage.map { ($0.path, $0) })
         let buffersByPath = Dictionary(grouping: snapshot.bufferedLines, by: \.path)
         let accumulatorByPath = Dictionary(uniqueKeysWithValues: snapshot.accumulators.map { ($0.path, $0) })
-        let currentRootDevices = Self.currentCodexRootDevices(rootMtimes: metadata.rootMtimes)
-        var remainingIdentityValidationVisits = CostUsageScanner.codexCatchUpScanCandidateLimit
-        var deferredIdentityValidationPaths: [String] = []
-        var completedIdentityValidationPaths: [String] = []
-        var invalidatedIdentityValidationPaths: [String] = []
 
         for file in snapshot.files {
             guard let detailsData = file.scanState.detailsPayload,
                   let details = try? JSONDecoder().decode(StoredFileDetails.self, from: detailsData)
             else { continue }
             let aggregates = (aggregatesByPath[file.path] ?? []).map(\.aggregate)
-            recorder?.recordUsageRowDecodes(count: rowsByPath[file.path]?.count ?? 0)
-            let rows = (rowsByPath[file.path] ?? []).compactMap {
-                try? JSONDecoder().decode(CostUsageScanner.CodexUsageRow.self, from: $0.payload)
+            let tokenSnapshotsLoaded = loadedTokenSnapshotPaths?.contains(file.path) ?? true
+            let usageRowsLoaded = loadedUsageRowPaths?.contains(file.path) ?? true
+            if details.hasTokenSnapshots, !tokenSnapshotsLoaded {
+                unloadedTokenSnapshotPathRecorder?(file.path)
             }
+            if details.hasRows, !usageRowsLoaded {
+                unloadedUsageRowPathRecorder?(file.path)
+            }
+            recorder?.recordUsageRowDecodes(count: rowsByPath[file.path]?.count ?? 0)
+            let rows = (rowsByPath[file.path] ?? []).compactMap(Self.usageRow(from:))
             let restoredRows = rows.isEmpty ? Self.aggregateRows(from: aggregates) : rows
+            let restoredTurnIDs = Self.restoredTurnIDs(
+                details: details,
+                rows: rows,
+                usageRowsLoaded: usageRowsLoaded,
+                path: file.path,
+                legacySummaryPathRecorder: legacyTurnIDSummaryPathRecorder)
             let tokenSnapshots = (snapshotsByPath[file.path] ?? []).map(Self.tokenSnapshot(from:))
             let lineage = lineageByPath[file.path]
             let accumulator = accumulatorByPath[file.path]
             let buffers = buffersByPath[file.path] ?? []
-            let normalizedIdentity = Self.normalizedCodexFileIdentity(
-                file: file,
-                currentRootDevices: currentRootDevices)
-            let identityNeedsValidation = normalizedIdentity != file.scanState.fileIdentity
-            let restoredScanState: RestoredCodexScanState
-            if identityNeedsValidation, remainingIdentityValidationVisits > 0 {
-                Self.codexCatchUpReconciliationVisitForTesting?()
-                remainingIdentityValidationVisits -= 1
-                restoredScanState = Self.restoredCodexScanState(
-                    file: file,
-                    currentRootDevices: currentRootDevices,
-                    validateMetadata: true)
-                if restoredScanState.isComplete, restoredScanState.validatedCurrentSnapshot {
-                    completedIdentityValidationPaths.append(file.path)
-                } else {
-                    invalidatedIdentityValidationPaths.append(file.path)
-                }
-            } else if identityNeedsValidation {
-                deferredIdentityValidationPaths.append(file.path)
-                restoredScanState = RestoredCodexScanState(
-                    identity: file.scanState.fileIdentity,
-                    isComplete: file.scanState.isComplete)
-            } else {
-                restoredScanState = RestoredCodexScanState(
-                    identity: normalizedIdentity,
-                    isComplete: file.scanState.isComplete)
-            }
             let usage = CostUsageFileUsage(
                 mtimeUnixMs: file.mtimeUnixMs,
                 size: file.size,
@@ -489,11 +495,14 @@ extension CostUsageStore {
                 codexPriorityCostNanos: nil,
                 codexStandardTokens: Self.modeTokens(from: aggregates, priority: false),
                 codexPriorityTokens: Self.modeTokens(from: aggregates, priority: true),
-                codexTurnIDs: details.hasTurnIDs ? CostUsageScanner.codexTurnIDs(rows: rows) ?? [] : nil,
+                codexTurnIDs: restoredTurnIDs,
+                codexTurnIDsAreUnloaded: details.hasTurnIDs && details.turnIDs == nil && !usageRowsLoaded
+                    ? true : nil,
                 codexWorkspaceContentFingerprint: details.workspaceFingerprint,
                 codexRows: details.hasRows ? restoredRows : nil,
-                codexTokenSnapshots: details.hasTokenSnapshots ? tokenSnapshots : nil,
-                codexTokenCheckpoints: details.hasTokenSnapshots
+                codexRowsAreUnloaded: details.hasRows && !usageRowsLoaded ? true : nil,
+                codexTokenSnapshots: details.hasTokenSnapshots && tokenSnapshotsLoaded ? tokenSnapshots : nil,
+                codexTokenCheckpoints: details.hasTokenSnapshots && tokenSnapshotsLoaded
                     ? CostUsageScanner.codexTokenCheckpoints(for: tokenSnapshots) : nil,
                 codexTokenTimestampsMonotonic: file.scanState.tokenTimestampsMonotonic,
                 codexTokenIndexAnchor: file.anchor.map {
@@ -503,15 +512,64 @@ extension CostUsageStore {
                         sha256: $0.sha256)
                 },
                 claudeRows: nil,
-                codexScanFileId: restoredScanState.identity,
+                codexScanFileId: file.scanState.fileIdentity,
                 codexScanTargetSize: file.scanState.targetSize,
-                codexScanComplete: restoredScanState.isComplete,
+                codexScanComplete: file.scanState.isComplete,
                 codexJSONLResumeState: file.scanState.resumePayload.flatMap {
                     try? JSONDecoder().decode(CostUsageJsonl.ResumeState.self, from: $0)
                 },
                 codexBufferedSubagentLines: Self.bufferedLines(buffers, kind: .subagent),
                 codexBufferedUnresolvedForkLines: Self.bufferedLines(buffers, kind: .unresolvedFork),
                 codexReadRetryBufferPresence: retryPresence.map { $0[file.path] ?? .init() })
+            cache.files[file.path] = usage
+        }
+        cache.days = Self.days(from: snapshot.dayAggregates)
+        return cache
+    }
+
+    static func reconciledCodexCache(
+        _ decoded: CostUsageCache,
+        persistence: CodexPersistenceState) -> CostUsageCache
+    {
+        var cache = decoded
+        let metadata = persistence.metadata
+        let currentRootDevices = Self.currentCodexRootDevices(rootMtimes: metadata.rootMtimes)
+        var remainingIdentityValidationVisits = CostUsageScanner.codexCatchUpScanCandidateLimit
+        var deferredIdentityValidationPaths: [String] = []
+        var completedIdentityValidationPaths: [String] = []
+        var invalidatedIdentityValidationPaths: [String] = []
+
+        for file in persistence.files {
+            guard var usage = cache.files[file.path] else { continue }
+            let normalizedIdentity = Self.normalizedCodexFileIdentity(
+                file: file,
+                currentRootDevices: currentRootDevices)
+            let identityNeedsValidation = normalizedIdentity != file.scanState.fileIdentity
+            let restoredScanState: RestoredCodexScanState
+            if identityNeedsValidation, remainingIdentityValidationVisits > 0 {
+                Self.codexCatchUpReconciliationVisitForTesting?()
+                remainingIdentityValidationVisits -= 1
+                restoredScanState = Self.restoredCodexScanState(
+                    file: file,
+                    currentRootDevices: currentRootDevices,
+                    validateMetadata: true)
+                if restoredScanState.isComplete, restoredScanState.validatedCurrentSnapshot {
+                    completedIdentityValidationPaths.append(file.path)
+                } else {
+                    invalidatedIdentityValidationPaths.append(file.path)
+                }
+            } else if identityNeedsValidation {
+                deferredIdentityValidationPaths.append(file.path)
+                restoredScanState = RestoredCodexScanState(
+                    identity: file.scanState.fileIdentity,
+                    isComplete: file.scanState.isComplete)
+            } else {
+                restoredScanState = RestoredCodexScanState(
+                    identity: normalizedIdentity,
+                    isComplete: file.scanState.isComplete)
+            }
+            usage.codexScanFileId = restoredScanState.identity
+            usage.codexScanComplete = restoredScanState.isComplete
             cache.files[file.path] = usage
         }
         Self.enqueueDeferredCodexIdentityValidation(
@@ -524,8 +582,27 @@ extension CostUsageStore {
         Self.reconcileCompletedCodexCatchUp(
             cache: &cache,
             visitLimit: remainingIdentityValidationVisits)
-        cache.days = Self.days(from: snapshot.dayAggregates)
         return cache
+    }
+
+    private static func restoredTurnIDs(
+        details: StoredFileDetails,
+        rows: [CostUsageScanner.CodexUsageRow],
+        usageRowsLoaded: Bool,
+        path: String,
+        legacySummaryPathRecorder: ((String) -> Void)?) -> [String]?
+    {
+        guard details.hasTurnIDs else {
+            return nil
+        }
+        if let turnIDs = details.turnIDs {
+            return turnIDs
+        }
+        if usageRowsLoaded {
+            return CostUsageScanner.codexTurnIDs(rows: rows) ?? []
+        }
+        legacySummaryPathRecorder?(path)
+        return []
     }
 
     private static func enqueueDeferredCodexIdentityValidation(
@@ -828,6 +905,10 @@ extension CostUsageStore {
         let sourceRows = usage.codexRows ?? []
         let snapshotCount = sourceSnapshots.count
         let rowCount = sourceRows.count
+        let baselineDetails = baseline.file?.scanState.detailsPayload.flatMap {
+            try? JSONDecoder().decode(StoredFileDetails.self, from: $0)
+        }
+        let turnIDsLoaded = baseline.usageRowsLoaded || usage.codexTurnIDsAreUnloaded != true
         let details = StoredFileDetails(
             lastTotals: usage.lastTotals,
             projectPath: usage.projectPath,
@@ -835,9 +916,14 @@ extension CostUsageStore {
             costCacheComplete: usage.codexCostCacheComplete,
             session: usage.codexSession,
             workspaceFingerprint: usage.codexWorkspaceContentFingerprint,
-            hasRows: usage.codexRows != nil,
-            hasTurnIDs: usage.codexTurnIDs != nil,
-            hasTokenSnapshots: usage.codexTokenSnapshots != nil,
+            turnIDs: turnIDsLoaded ? usage.codexTurnIDs : baselineDetails?.turnIDs,
+            hasRows: baseline.usageRowsLoaded ? usage.codexRows != nil : baselineDetails?.hasRows ?? false,
+            hasTurnIDs: turnIDsLoaded
+                ? usage.codexTurnIDs != nil
+                : baselineDetails?.hasTurnIDs ?? false,
+            hasTokenSnapshots: baseline.tokenSnapshotsLoaded
+                ? usage.codexTokenSnapshots != nil
+                : baselineDetails?.hasTokenSnapshots ?? false,
             hasSeenRawTotals: usage.seenRawTotals != nil,
             divergentTotals: usage.hasDivergentTotals,
             interleavedTotals: usage.hasInterleavedTotals)
@@ -858,7 +944,9 @@ extension CostUsageStore {
                 isComplete: usage.codexScanComplete != false,
                 resumePayload: usage.codexJSONLResumeState.flatMap { try? JSONEncoder().encode($0) },
                 tokenTimestampsMonotonic: usage.codexTokenTimestampsMonotonic,
-                nextUsageRowIndex: CostUsageScanner.nextCodexUsageRowIndex(usage.codexRows),
+                nextUsageRowIndex: baseline.usageRowsLoaded
+                    ? CostUsageScanner.nextCodexUsageRowIndex(usage.codexRows)
+                    : baseline.nextUsageRowIndex ?? baseline.file?.scanState.nextUsageRowIndex,
                 lastModel: usage.lastModel,
                 lastTurnID: usage.lastCodexTurnID,
                 fileIdentity: usage.codexScanFileId,
@@ -875,12 +963,16 @@ extension CostUsageStore {
             && baseline.file?.scanState.fileIdentity == file.scanState.fileIdentity
             && oldParsedBytes < newParsedBytes
         let stableCursor = oldParsedBytes == newParsedBytes
-        let snapshotAction = CostUsagePersistencePlanner.action(
-            canReuse: baseline.canReuseRows,
-            stableCursor: stableCursor,
-            appendSafe: appendSafe,
-            persistedCount: baseline.snapshotCount,
-            sourceCount: snapshotCount)
+        let snapshotAction: CostUsagePersistenceAction = if baseline.tokenSnapshotsLoaded {
+            CostUsagePersistencePlanner.action(
+                canReuse: baseline.canReuseRows,
+                stableCursor: stableCursor,
+                appendSafe: appendSafe,
+                persistedCount: baseline.snapshotCount,
+                sourceCount: snapshotCount)
+        } else {
+            .reuse
+        }
         let snapshots = snapshotAction.materialize(sourceSnapshots) { index, snapshot in
             Self.tokenSnapshot(path: path, eventIndex: index, snapshot: snapshot, calendar: calendar)
         }
@@ -893,12 +985,16 @@ extension CostUsageStore {
             _ = self.replaceTokenSnapshots(path: path, snapshots: snapshots)
         }
 
-        let rowAction = CostUsagePersistencePlanner.action(
-            canReuse: baseline.canReuseRows,
-            stableCursor: stableCursor,
-            appendSafe: appendSafe,
-            persistedCount: baseline.rowCount,
-            sourceCount: rowCount)
+        let rowAction: CostUsagePersistenceAction = if baseline.usageRowsLoaded {
+            CostUsagePersistencePlanner.action(
+                canReuse: baseline.canReuseRows,
+                stableCursor: stableCursor,
+                appendSafe: appendSafe,
+                persistedCount: baseline.rowCount,
+                sourceCount: rowCount)
+        } else {
+            .reuse
+        }
         let rows: [CostUsageStoreUsageRow] = rowAction.materialize(sourceRows) { index, row in
             guard let payload = try? JSONEncoder().encode(row) else { return nil }
             return CostUsageStoreUsageRow(path: path, rowIndex: index, payload: payload)
@@ -911,8 +1007,10 @@ extension CostUsageStore {
         case .replace:
             _ = self.replaceUsageRows(path: path, rows: rows)
         }
-        _ = self.replaceFileDayAggregates(path: path, aggregates: Self.fileAggregates(
-            usage, recorder: self.scopedReadWorkRecorderForTesting))
+        if baseline.usageRowsLoaded {
+            _ = self.replaceFileDayAggregates(path: path, aggregates: Self.fileAggregates(
+                usage, recorder: self.scopedReadWorkRecorderForTesting))
+        }
         _ = self.upsertForkLineage(CostUsageStoreForkLineage(
             path: path,
             sessionID: usage.sessionId,
@@ -924,8 +1022,10 @@ extension CostUsageStore {
         self.persistBuffers(path: path, usage: usage)
         _ = self.upsertAccumulator(CostUsageStoreAccumulator(
             path: path,
-            eventCount: snapshotCount,
-            nextUsageRowIndex: CostUsageScanner.nextCodexUsageRowIndex(usage.codexRows),
+            eventCount: baseline.tokenSnapshotsLoaded ? snapshotCount : baseline.snapshotCount,
+            nextUsageRowIndex: baseline.usageRowsLoaded
+                ? CostUsageScanner.nextCodexUsageRowIndex(usage.codexRows)
+                : baseline.nextUsageRowIndex ?? baseline.file?.scanState.nextUsageRowIndex,
             countedTotals: Self.totals(usage.lastCountedTotals),
             rawTotalsBaseline: Self.totals(usage.lastRawTotalsBaseline),
             rawTotalsWatermark: Self.totals(usage.lastRawTotalsWatermark),
@@ -964,14 +1064,6 @@ extension CostUsageStore {
             turnKeys: cache.codexPriorityTurnKeys,
             turnIDsByDay: cache.codexPriorityTurnIDsByDay,
             turnsCursor: cache.codexPriorityTurnsCursor))
-    }
-
-    private static func persistedPriorityTurnsCursor(
-        _ snapshot: CostUsageStoreSnapshot) -> CostUsageScanner.CodexPriorityTurnsPersistedCursor?
-    {
-        snapshot.metadata.priorityTurnStatePayload.flatMap {
-            try? JSONDecoder().decode(StoredPriorityState.self, from: $0)
-        }?.turnsCursor
     }
 
     private static func previousReport(
@@ -1053,6 +1145,8 @@ extension CostUsageStore {
 
     private static func globalAggregates(
         cache: CostUsageCache,
+        persistedFileAggregates: [CostUsageStoreFileDayAggregate] = [],
+        unloadedUsageRowPaths: Set<String> = [],
         recorder: CostUsageStoreReadWorkRecorder?) -> [CostUsageStoreDayAggregate]
     {
         var values: [DayModelKey: CostUsageStoreDayAggregate] = [:]
@@ -1065,8 +1159,14 @@ extension CostUsageStore {
                 values[DayModelKey(day: day, model: model)] = aggregate
             }
         }
-        for usage in cache.files.values {
-            for aggregate in self.fileAggregates(usage, recorder: recorder) {
+        let persistedByPath = Dictionary(grouping: persistedFileAggregates, by: \.path)
+        for (path, usage) in cache.files {
+            let fileAggregates = if unloadedUsageRowPaths.contains(path) {
+                (persistedByPath[path] ?? []).map(\.aggregate)
+            } else {
+                self.fileAggregates(usage, recorder: recorder)
+            }
+            for aggregate in fileAggregates {
                 let key = DayModelKey(day: aggregate.day, model: aggregate.model)
                 guard var value = values[key] else { continue }
                 value.reasoningTokens += aggregate.reasoningTokens
@@ -1246,12 +1346,16 @@ extension CostUsageStore {
             endOffset: snapshot.endOffset)
     }
 
-    private static func tokenSnapshot(from value: CostUsageStoreTokenSnapshot) -> CostUsageCodexTokenSnapshot {
+    static func tokenSnapshot(from value: CostUsageStoreTokenSnapshot) -> CostUsageCodexTokenSnapshot {
         CostUsageCodexTokenSnapshot(
             timestamp: value.timestamp,
             last: self.totals(from: value.last),
             total: self.totals(from: value.total),
             endOffset: value.endOffset)
+    }
+
+    static func usageRow(from value: CostUsageStoreUsageRow) -> CostUsageScanner.CodexUsageRow? {
+        try? JSONDecoder().decode(CostUsageScanner.CodexUsageRow.self, from: value.payload)
     }
 
     private func persistBuffers(path: String, usage: CostUsageFileUsage) {
@@ -1285,7 +1389,7 @@ extension CostUsageStore {
     }
 
     private func deleteRemovedFiles(
-        previous: CostUsageStoreSnapshot,
+        previous: CodexPersistenceState,
         cache: CostUsageCache)
     {
         for path in previous.files.map(\.path) where cache.files[path] == nil {
@@ -1335,6 +1439,14 @@ extension CostUsageStore {
 struct CostUsageStoreLoad: @unchecked Sendable {
     var store: CostUsageStore
     var cache: CostUsageCache
+    var receipt: CostUsageStore.CodexBaselineReceipt
+    var unloadedTokenSnapshotPaths: Set<String> = []
+    var unloadedUsageRowPaths: Set<String> = []
+    var legacyTurnIDSummaryPaths: Set<String> = []
+
+    func release() {
+        self.store.syncReleaseCodexBaseline(self.receipt)
+    }
 }
 
 enum CostUsageStoreAccess {
@@ -1348,12 +1460,15 @@ enum CostUsageStoreAccess {
 
     static func load(cacheRoot: URL?, calendar: Calendar) -> CostUsageStoreLoad {
         let store = CostUsageStore(cacheRoot: cacheRoot)
-        let cache = store.syncLoadCodexCache(calendar: calendar)
-        return CostUsageStoreLoad(store: store, cache: cache)
+        return store.syncLoadCodexScan(calendar: calendar)
+    }
+
+    static func loadForScan(cacheRoot: URL?, calendar: Calendar) -> CostUsageStoreLoad {
+        self.load(cacheRoot: cacheRoot, calendar: calendar)
     }
 
     static func read(cacheRoot: URL?, calendar: Calendar = .current) -> CostUsageCache {
-        self.load(cacheRoot: cacheRoot, calendar: calendar).cache
+        CostUsageStore(cacheRoot: cacheRoot).syncLoadCodexCache(calendar: calendar)
     }
 
     /// Test and maintenance mutation seam for metadata-only edits. Scanner writes should keep
@@ -1365,13 +1480,15 @@ enum CostUsageStoreAccess {
         calendar: Calendar = .current) -> CostUsageStoreBudgetResult
     {
         let loaded = self.load(cacheRoot: cacheRoot, calendar: calendar)
+        defer { loaded.release() }
         let since = cache.scanSinceKey ?? "0000-01-01"
         let until = cache.scanUntilKey ?? "9999-12-31"
         return self.save(
             store: loaded.store,
             cache: cache,
             calendar: calendar,
-            requestedScanWindow: (sinceKey: since, untilKey: until))
+            requestedScanWindow: (sinceKey: since, untilKey: until),
+            receipt: loaded.receipt)
     }
 
     @discardableResult
@@ -1381,13 +1498,19 @@ enum CostUsageStoreAccess {
         calendar: Calendar,
         requestedScanWindow: (sinceKey: String, untilKey: String),
         reportWindow: (sinceKey: String, untilKey: String)? = nil,
-        skipIdenticalContent: Bool = false) -> CostUsageStoreBudgetResult
+        unloadedTokenSnapshotPaths: Set<String> = [],
+        unloadedUsageRowPaths: Set<String> = [],
+        skipIdenticalContent: Bool = false,
+        receipt: CostUsageStore.CodexBaselineReceipt? = nil) -> CostUsageStoreBudgetResult
     {
         store.syncSaveCodexCache(
             cache,
             calendar: calendar,
             requestedScanWindow: requestedScanWindow,
             reportWindow: reportWindow,
-            skipIdenticalContent: skipIdenticalContent)
+            unloadedTokenSnapshotPaths: unloadedTokenSnapshotPaths,
+            unloadedUsageRowPaths: unloadedUsageRowPaths,
+            skipIdenticalContent: skipIdenticalContent,
+            receipt: receipt)
     }
 }

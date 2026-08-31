@@ -42,6 +42,9 @@ Usage source picker:
 - Suspicious weekly resets keep the last trusted usage while confirmation is pending. A successful refresh for the
   same account and workspace clears stale connectivity errors even when the reading is withheld; failed, cancelled,
   or superseded refreshes do not clear them. Cached usage, credits, and other accounts remain unchanged.
+- Credits-only updates preserve pending weekly-reset evidence in memory and account-snapshot storage, including
+  when published credits are cleared. Candidate admission, expiry, boundary tolerances, and account guards remain
+  unchanged; preserving evidence does not make an otherwise incompatible reset eligible for publication.
 - Debug logs in `codex-weekly-reset-publication` include fixed reason codes for delayed-candidate
   creation, pruning, revalidation, and account-scoped storage requests. They distinguish source/confidence,
   timing, boundary, identity/plan compatibility, and credit-inventory failures without logging account or credit
@@ -204,7 +207,10 @@ Example:
   - Catch-up status reads progress metadata without loading historical usage JSON or replay bodies. Cached reports
     retain row-level pricing evidence and project/session details, but omit raw token snapshots, accumulator state,
     and replay bodies. File cursor metadata, including JSONL resume state, remains available for progress tracking.
-    Scanner and save operations still load the complete state; fresh database opens retain integrity validation.
+    A native scan loads complete state once and carries a single-use receipt to save. The store reuses decoded
+    rows only while the same connection, database identity and SQLite change observations remain valid,
+    checking again under the writer lock. Filesystem/anchor and catch-up reconciliation still run at comparison
+    time; a concurrent database change requests a rescan. Fresh database opens retain integrity validation.
   - Saved day/model aggregates group each file's usage rows in one pass per aggregate build. Packed token totals,
     authoritative costs (including zero), and standard/priority estimation buckets retain their existing meanings.
 - Window: configurable 1-365 day rolling history.

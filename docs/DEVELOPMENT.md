@@ -182,6 +182,63 @@ reads after setup has closed each file. This avoids per-file atomic publication 
 without changing corpus contents or scan budgets. The shared atomic fixture writer remains available
 for replacement and publication tests.
 
+### Cost scanner CPU regressions
+
+Profile the cost-scan queue separately from the main thread. A busy background scan that later settles
+does not establish an infinite loop. Native timestamp conversion uses Foundation's modern ISO parser
+for strict RFC3339 input, retaining the previous formatter's millisecond truncation and rounding.
+Historical spellings and malformed input keep the formatter fallback. Claude reuses the parsed date
+for local day projection only on the strict path.
+
+`CostUsageTimestampTests` compares exact dates with the prior formatter and checks local days, DST,
+deduplication, and dated pricing. `CostUsageTimestampOrderTests` and `CostUsageStoreCutoverTests` count
+timestamp comparisons: a known ordered prefix needs only the append boundary and new events; unknown
+prefixes get one cancellable validation. Keep these assertions deterministic rather than timing gates.
+Run these alongside scanner, cancellation, bounded-progress, fork, and performance-gate suites with
+the test harness's Keychain and credential-file isolation enabled.
+
+An optimized synthetic check on 2026-08-30 compared main `5a18e8ee9` with this change: three cold
+Claude scans of 20,000 messages (5,237,780 bytes) had median CPU time of 3.430 → 1.273 seconds and
+wall time of 5.838 → 2.107 seconds, with identical emitted token/cost totals and daily output. This
+measures ingestion through the public fetcher, not idle-app CPU or the entire Codex scan pipeline.
+
+Native Codex scans carry an opaque receipt from load to save. `CostUsageStore` owns one decoded persisted
+baseline and compact file/count metadata, releasing it on save, superseding loads, mutations, failures,
+or scan exit (including cancellation and debounce). Abandoned receipts also release through the actor.
+No raw historical SQL snapshot or transaction stays alive across JSONL scanning. Filesystem/device,
+anchor, and pending catch-up reconciliation rerun for comparisons; decoded reuse never freezes them.
+
+Reuse requires the same connection generation and database inode, SQLite's open-file identity check,
+same-connection `data_version`, own `total_changes`, and schema/parser metadata. Observations bracket
+a successfully committed short read transaction. Save checks again under `BEGIN IMMEDIATE`, after
+unchanged-path retention; external changes request a rescan without overwriting current content.
+Retention that rewrites identical metadata requires a fresh locked semantic comparison. Existing callers
+without a receipt read a fresh baseline at save and cannot establish freshness back to an earlier load.
+
+`CostUsageStoreReadWorkTests` counts full load/save cycles: an uncontended unchanged receipt cycle reads
+one full snapshot and decodes each usage row once, with one freshness write and no aggregate grouping
+visits. Synthetic interleavings cover writer races, mutations, retention, replacement and receipt lifetime.
+Initial decoding, semantic equality, filesystem reconciliation, report generation and priority aggregation
+still cost work proportional to retained history. These counters do not measure installed-app idle CPU;
+refresh cadence, scan budgets, timestamp parsing and incremental-order validation are unchanged.
+
+Claude/Vertex metadata classification searches decoded ASCII strings with case-folded bytes, keeping
+the original Foundation lowercase/substring predicate for non-ASCII or noncontiguous strings. Check
+the whole string for ASCII before matching; combining characters after a marker can affect the old
+predicate. The recursive dictionary/array walk still visits the same content, but no longer repeats
+root/message metadata subtrees already visited through the root. `CostUsageClaudeVertexClassifierTests`
+compares with the frozen old predicate and checks complete filtered rows, daily tokens/costs, and reports,
+including decoded JSON escapes, Unicode boundaries, nested arrays, and false/numeric metadata flags.
+Claude-only source files are excluded from the Codex parser hash, so this optimization does not
+invalidate native Codex caches or change predecessor adoption.
+
+A second optimized synthetic check against main `354191af9` used three fresh-cache scans per provider
+with 32–128 KiB text bodies. Median CPU decreased by 3–18% across Claude/Vertex cases (the 3% case is
+small); a separate long-provider-string stress case decreased by 73–75%. The isolated decoded metadata
+predicate used about half the CPU on ordinary nested metadata. Every daily token component and cost
+matched, including the existing unset public request counts. Fixture generation was outside timing;
+wall time was recorded separately under host load. These results do not measure idle-app CPU.
+
 ### Adaptive refresh fixtures
 
 Heuristics and timer tests seed disabled providers through `testSettingsStore(config:)`, which saves the
@@ -230,6 +287,12 @@ scope decoding, and denial are compiled in release builds too. `bash Scripts/tes
 compiles the actual policy and detector with optimization and without `DEBUG`, then checks denied,
 scoped-child, and non-test decisions against synthetic temporary files. It does not build or exercise
 the complete release CLI, refresh a real account, or establish isolation for other providers.
+
+The same runtime and inherited Codex-file isolation signal also redirects the scanner's default priority trace
+database to a process-local, nonexistent temporary path before consulting the user home. Supplying a fixture
+session root alone does not select a trace database. Tests exercising priority metadata should pass an explicitly
+owned `codexTraceDatabaseURL`; these overrides and the production `~/.codex/logs_2.sqlite` default are unchanged.
+The optimized child-policy proof above also verifies this fallback, independently of Keychain opt-ins.
 
 ### Provider session fixtures
 
