@@ -99,6 +99,8 @@ extension CostUsageStore {
         reportWindow: (sinceKey: String, untilKey: String)? = nil,
         rowBudget: Int = CostUsageStore.defaultRowBudget,
         fileBudgetBytes: Int64 = CostUsageStore.defaultFileBudgetBytes,
+        unloadedTokenSnapshotPaths: Set<String> = [],
+        unloadedUsageRowPaths: Set<String> = [],
         skipIdenticalContent: Bool = false,
         receipt: CodexBaselineReceipt? = nil) -> CostUsageStoreBudgetResult
     {
@@ -167,13 +169,19 @@ extension CostUsageStore {
                     file: previousFilesByPath[path],
                     snapshotCount: previous.snapshotCounts[path] ?? 0,
                     rowCount: previous.rowCounts[path] ?? 0,
+                    tokenSnapshotsLoaded: !unloadedTokenSnapshotPaths.contains(path),
+                    usageRowsLoaded: !unloadedUsageRowPaths.contains(path),
+                    nextUsageRowIndex: previousFilesByPath[path]?.scanState.nextUsageRowIndex,
                     canReuseRows: canReuseStoredRows),
                 calendar: calendar)
             persistedFiles += 1
             Self.saveCycleCheckpointForTesting?(persistedFiles)
         }
         _ = self.replaceDayAggregates(Self.globalAggregates(
-            cache: cache, recorder: self.scopedReadWorkRecorderForTesting))
+            cache: cache,
+            persistedFileAggregates: previous.fileDayAggregates,
+            unloadedUsageRowPaths: unloadedUsageRowPaths,
+            recorder: self.scopedReadWorkRecorderForTesting))
         _ = self.setMetadata(Self.metadata(cache: cache, calendar: calendar))
         _ = self.setDiscoveryState(Self.discoveryState(cache.codexSessionDiscovery))
         _ = self.setLookbackState(Self.lookbackState(cache.codexActiveLookbackState))
@@ -213,8 +221,9 @@ extension CostUsageStore {
     }
 
     /// True when persisting `cache` would leave every content table semantically unchanged.
-    /// This remains O(persisted cache rows), but reuses typed decoding and reruns current
-    /// filesystem/anchor reconciliation. The
+    /// This is O(persisted summary rows plus histories loaded for this scanner pass): it
+    /// reuses typed decoding and reruns current filesystem/anchor reconciliation; it never
+    /// parses timestamps or opens session JSONL files. The
     /// persisted spellings of a few optional fields differ from their in-memory forms
     /// (`catchUpPending` and `codexScanComplete` store nil as false/true, `timeZoneIdentifier`
     /// is fixed by the caller's calendar, and `lastScanUnixMs` is a wall-clock stamp), so
@@ -293,6 +302,7 @@ extension CostUsageStore {
         var costCacheComplete: Bool?
         var session: CostUsageCodexSessionMetadata?
         var workspaceFingerprint: String?
+        var turnIDs: [String]?
         var hasRows: Bool
         var hasTurnIDs: Bool
         var hasTokenSnapshots: Bool
@@ -343,6 +353,9 @@ extension CostUsageStore {
         var file: CostUsageStoreFile?
         var snapshotCount: Int
         var rowCount: Int
+        var tokenSnapshotsLoaded: Bool
+        var usageRowsLoaded: Bool
+        var nextUsageRowIndex: Int?
         var canReuseRows: Bool
     }
 
@@ -360,17 +373,35 @@ extension CostUsageStore {
     private static func cache(
         from snapshot: CostUsageStoreSnapshot,
         recorder: CostUsageStoreReadWorkRecorder?,
-        retryPresence: [String: CostUsageCodexRetryBufferPresence]? = nil) -> CostUsageCache
+        retryPresence: [String: CostUsageCodexRetryBufferPresence]? = nil,
+        loadedTokenSnapshotPaths: Set<String>? = nil,
+        loadedUsageRowPaths: Set<String>? = nil,
+        unloadedTokenSnapshotPathRecorder: ((String) -> Void)? = nil,
+        unloadedUsageRowPathRecorder: ((String) -> Void)? = nil,
+        legacyTurnIDSummaryPathRecorder: ((String) -> Void)? = nil) -> CostUsageCache
     {
         self.reconciledCodexCache(
-            self.decodeCodexCache(from: snapshot, recorder: recorder, retryPresence: retryPresence),
+            self.decodeCodexCache(
+                from: snapshot,
+                recorder: recorder,
+                retryPresence: retryPresence,
+                loadedTokenSnapshotPaths: loadedTokenSnapshotPaths,
+                loadedUsageRowPaths: loadedUsageRowPaths,
+                unloadedTokenSnapshotPathRecorder: unloadedTokenSnapshotPathRecorder,
+                unloadedUsageRowPathRecorder: unloadedUsageRowPathRecorder,
+                legacyTurnIDSummaryPathRecorder: legacyTurnIDSummaryPathRecorder),
             persistence: CodexPersistenceState(snapshot: snapshot))
     }
 
     static func decodeCodexCache(
         from snapshot: CostUsageStoreSnapshot,
         recorder: CostUsageStoreReadWorkRecorder?,
-        retryPresence: [String: CostUsageCodexRetryBufferPresence]? = nil) -> CostUsageCache
+        retryPresence: [String: CostUsageCodexRetryBufferPresence]? = nil,
+        loadedTokenSnapshotPaths: Set<String>? = nil,
+        loadedUsageRowPaths: Set<String>? = nil,
+        unloadedTokenSnapshotPathRecorder: ((String) -> Void)? = nil,
+        unloadedUsageRowPathRecorder: ((String) -> Void)? = nil,
+        legacyTurnIDSummaryPathRecorder: ((String) -> Void)? = nil) -> CostUsageCache
     {
         recorder?.recordCacheConversion()
         var cache = CostUsageCache()
@@ -414,11 +445,23 @@ extension CostUsageStore {
                   let details = try? JSONDecoder().decode(StoredFileDetails.self, from: detailsData)
             else { continue }
             let aggregates = (aggregatesByPath[file.path] ?? []).map(\.aggregate)
-            recorder?.recordUsageRowDecodes(count: rowsByPath[file.path]?.count ?? 0)
-            let rows = (rowsByPath[file.path] ?? []).compactMap {
-                try? JSONDecoder().decode(CostUsageScanner.CodexUsageRow.self, from: $0.payload)
+            let tokenSnapshotsLoaded = loadedTokenSnapshotPaths?.contains(file.path) ?? true
+            let usageRowsLoaded = loadedUsageRowPaths?.contains(file.path) ?? true
+            if details.hasTokenSnapshots, !tokenSnapshotsLoaded {
+                unloadedTokenSnapshotPathRecorder?(file.path)
             }
+            if details.hasRows, !usageRowsLoaded {
+                unloadedUsageRowPathRecorder?(file.path)
+            }
+            recorder?.recordUsageRowDecodes(count: rowsByPath[file.path]?.count ?? 0)
+            let rows = (rowsByPath[file.path] ?? []).compactMap(Self.usageRow(from:))
             let restoredRows = rows.isEmpty ? Self.aggregateRows(from: aggregates) : rows
+            let restoredTurnIDs = Self.restoredTurnIDs(
+                details: details,
+                rows: rows,
+                usageRowsLoaded: usageRowsLoaded,
+                path: file.path,
+                legacySummaryPathRecorder: legacyTurnIDSummaryPathRecorder)
             let tokenSnapshots = (snapshotsByPath[file.path] ?? []).map(Self.tokenSnapshot(from:))
             let lineage = lineageByPath[file.path]
             let accumulator = accumulatorByPath[file.path]
@@ -452,11 +495,14 @@ extension CostUsageStore {
                 codexPriorityCostNanos: nil,
                 codexStandardTokens: Self.modeTokens(from: aggregates, priority: false),
                 codexPriorityTokens: Self.modeTokens(from: aggregates, priority: true),
-                codexTurnIDs: details.hasTurnIDs ? CostUsageScanner.codexTurnIDs(rows: rows) ?? [] : nil,
+                codexTurnIDs: restoredTurnIDs,
+                codexTurnIDsAreUnloaded: details.hasTurnIDs && details.turnIDs == nil && !usageRowsLoaded
+                    ? true : nil,
                 codexWorkspaceContentFingerprint: details.workspaceFingerprint,
                 codexRows: details.hasRows ? restoredRows : nil,
-                codexTokenSnapshots: details.hasTokenSnapshots ? tokenSnapshots : nil,
-                codexTokenCheckpoints: details.hasTokenSnapshots
+                codexRowsAreUnloaded: details.hasRows && !usageRowsLoaded ? true : nil,
+                codexTokenSnapshots: details.hasTokenSnapshots && tokenSnapshotsLoaded ? tokenSnapshots : nil,
+                codexTokenCheckpoints: details.hasTokenSnapshots && tokenSnapshotsLoaded
                     ? CostUsageScanner.codexTokenCheckpoints(for: tokenSnapshots) : nil,
                 codexTokenTimestampsMonotonic: file.scanState.tokenTimestampsMonotonic,
                 codexTokenIndexAnchor: file.anchor.map {
@@ -537,6 +583,26 @@ extension CostUsageStore {
             cache: &cache,
             visitLimit: remainingIdentityValidationVisits)
         return cache
+    }
+
+    private static func restoredTurnIDs(
+        details: StoredFileDetails,
+        rows: [CostUsageScanner.CodexUsageRow],
+        usageRowsLoaded: Bool,
+        path: String,
+        legacySummaryPathRecorder: ((String) -> Void)?) -> [String]?
+    {
+        guard details.hasTurnIDs else {
+            return nil
+        }
+        if let turnIDs = details.turnIDs {
+            return turnIDs
+        }
+        if usageRowsLoaded {
+            return CostUsageScanner.codexTurnIDs(rows: rows) ?? []
+        }
+        legacySummaryPathRecorder?(path)
+        return []
     }
 
     private static func enqueueDeferredCodexIdentityValidation(
@@ -839,6 +905,10 @@ extension CostUsageStore {
         let sourceRows = usage.codexRows ?? []
         let snapshotCount = sourceSnapshots.count
         let rowCount = sourceRows.count
+        let baselineDetails = baseline.file?.scanState.detailsPayload.flatMap {
+            try? JSONDecoder().decode(StoredFileDetails.self, from: $0)
+        }
+        let turnIDsLoaded = baseline.usageRowsLoaded || usage.codexTurnIDsAreUnloaded != true
         let details = StoredFileDetails(
             lastTotals: usage.lastTotals,
             projectPath: usage.projectPath,
@@ -846,9 +916,14 @@ extension CostUsageStore {
             costCacheComplete: usage.codexCostCacheComplete,
             session: usage.codexSession,
             workspaceFingerprint: usage.codexWorkspaceContentFingerprint,
-            hasRows: usage.codexRows != nil,
-            hasTurnIDs: usage.codexTurnIDs != nil,
-            hasTokenSnapshots: usage.codexTokenSnapshots != nil,
+            turnIDs: turnIDsLoaded ? usage.codexTurnIDs : baselineDetails?.turnIDs,
+            hasRows: baseline.usageRowsLoaded ? usage.codexRows != nil : baselineDetails?.hasRows ?? false,
+            hasTurnIDs: turnIDsLoaded
+                ? usage.codexTurnIDs != nil
+                : baselineDetails?.hasTurnIDs ?? false,
+            hasTokenSnapshots: baseline.tokenSnapshotsLoaded
+                ? usage.codexTokenSnapshots != nil
+                : baselineDetails?.hasTokenSnapshots ?? false,
             hasSeenRawTotals: usage.seenRawTotals != nil,
             divergentTotals: usage.hasDivergentTotals,
             interleavedTotals: usage.hasInterleavedTotals)
@@ -869,7 +944,9 @@ extension CostUsageStore {
                 isComplete: usage.codexScanComplete != false,
                 resumePayload: usage.codexJSONLResumeState.flatMap { try? JSONEncoder().encode($0) },
                 tokenTimestampsMonotonic: usage.codexTokenTimestampsMonotonic,
-                nextUsageRowIndex: CostUsageScanner.nextCodexUsageRowIndex(usage.codexRows),
+                nextUsageRowIndex: baseline.usageRowsLoaded
+                    ? CostUsageScanner.nextCodexUsageRowIndex(usage.codexRows)
+                    : baseline.nextUsageRowIndex ?? baseline.file?.scanState.nextUsageRowIndex,
                 lastModel: usage.lastModel,
                 lastTurnID: usage.lastCodexTurnID,
                 fileIdentity: usage.codexScanFileId,
@@ -886,12 +963,16 @@ extension CostUsageStore {
             && baseline.file?.scanState.fileIdentity == file.scanState.fileIdentity
             && oldParsedBytes < newParsedBytes
         let stableCursor = oldParsedBytes == newParsedBytes
-        let snapshotAction = CostUsagePersistencePlanner.action(
-            canReuse: baseline.canReuseRows,
-            stableCursor: stableCursor,
-            appendSafe: appendSafe,
-            persistedCount: baseline.snapshotCount,
-            sourceCount: snapshotCount)
+        let snapshotAction: CostUsagePersistenceAction = if baseline.tokenSnapshotsLoaded {
+            CostUsagePersistencePlanner.action(
+                canReuse: baseline.canReuseRows,
+                stableCursor: stableCursor,
+                appendSafe: appendSafe,
+                persistedCount: baseline.snapshotCount,
+                sourceCount: snapshotCount)
+        } else {
+            .reuse
+        }
         let snapshots = snapshotAction.materialize(sourceSnapshots) { index, snapshot in
             Self.tokenSnapshot(path: path, eventIndex: index, snapshot: snapshot, calendar: calendar)
         }
@@ -904,12 +985,16 @@ extension CostUsageStore {
             _ = self.replaceTokenSnapshots(path: path, snapshots: snapshots)
         }
 
-        let rowAction = CostUsagePersistencePlanner.action(
-            canReuse: baseline.canReuseRows,
-            stableCursor: stableCursor,
-            appendSafe: appendSafe,
-            persistedCount: baseline.rowCount,
-            sourceCount: rowCount)
+        let rowAction: CostUsagePersistenceAction = if baseline.usageRowsLoaded {
+            CostUsagePersistencePlanner.action(
+                canReuse: baseline.canReuseRows,
+                stableCursor: stableCursor,
+                appendSafe: appendSafe,
+                persistedCount: baseline.rowCount,
+                sourceCount: rowCount)
+        } else {
+            .reuse
+        }
         let rows: [CostUsageStoreUsageRow] = rowAction.materialize(sourceRows) { index, row in
             guard let payload = try? JSONEncoder().encode(row) else { return nil }
             return CostUsageStoreUsageRow(path: path, rowIndex: index, payload: payload)
@@ -922,8 +1007,10 @@ extension CostUsageStore {
         case .replace:
             _ = self.replaceUsageRows(path: path, rows: rows)
         }
-        _ = self.replaceFileDayAggregates(path: path, aggregates: Self.fileAggregates(
-            usage, recorder: self.scopedReadWorkRecorderForTesting))
+        if baseline.usageRowsLoaded {
+            _ = self.replaceFileDayAggregates(path: path, aggregates: Self.fileAggregates(
+                usage, recorder: self.scopedReadWorkRecorderForTesting))
+        }
         _ = self.upsertForkLineage(CostUsageStoreForkLineage(
             path: path,
             sessionID: usage.sessionId,
@@ -935,8 +1022,10 @@ extension CostUsageStore {
         self.persistBuffers(path: path, usage: usage)
         _ = self.upsertAccumulator(CostUsageStoreAccumulator(
             path: path,
-            eventCount: snapshotCount,
-            nextUsageRowIndex: CostUsageScanner.nextCodexUsageRowIndex(usage.codexRows),
+            eventCount: baseline.tokenSnapshotsLoaded ? snapshotCount : baseline.snapshotCount,
+            nextUsageRowIndex: baseline.usageRowsLoaded
+                ? CostUsageScanner.nextCodexUsageRowIndex(usage.codexRows)
+                : baseline.nextUsageRowIndex ?? baseline.file?.scanState.nextUsageRowIndex,
             countedTotals: Self.totals(usage.lastCountedTotals),
             rawTotalsBaseline: Self.totals(usage.lastRawTotalsBaseline),
             rawTotalsWatermark: Self.totals(usage.lastRawTotalsWatermark),
@@ -1056,6 +1145,8 @@ extension CostUsageStore {
 
     private static func globalAggregates(
         cache: CostUsageCache,
+        persistedFileAggregates: [CostUsageStoreFileDayAggregate] = [],
+        unloadedUsageRowPaths: Set<String> = [],
         recorder: CostUsageStoreReadWorkRecorder?) -> [CostUsageStoreDayAggregate]
     {
         var values: [DayModelKey: CostUsageStoreDayAggregate] = [:]
@@ -1068,8 +1159,14 @@ extension CostUsageStore {
                 values[DayModelKey(day: day, model: model)] = aggregate
             }
         }
-        for usage in cache.files.values {
-            for aggregate in self.fileAggregates(usage, recorder: recorder) {
+        let persistedByPath = Dictionary(grouping: persistedFileAggregates, by: \.path)
+        for (path, usage) in cache.files {
+            let fileAggregates = if unloadedUsageRowPaths.contains(path) {
+                (persistedByPath[path] ?? []).map(\.aggregate)
+            } else {
+                self.fileAggregates(usage, recorder: recorder)
+            }
+            for aggregate in fileAggregates {
                 let key = DayModelKey(day: aggregate.day, model: aggregate.model)
                 guard var value = values[key] else { continue }
                 value.reasoningTokens += aggregate.reasoningTokens
@@ -1249,12 +1346,16 @@ extension CostUsageStore {
             endOffset: snapshot.endOffset)
     }
 
-    private static func tokenSnapshot(from value: CostUsageStoreTokenSnapshot) -> CostUsageCodexTokenSnapshot {
+    static func tokenSnapshot(from value: CostUsageStoreTokenSnapshot) -> CostUsageCodexTokenSnapshot {
         CostUsageCodexTokenSnapshot(
             timestamp: value.timestamp,
             last: self.totals(from: value.last),
             total: self.totals(from: value.total),
             endOffset: value.endOffset)
+    }
+
+    static func usageRow(from value: CostUsageStoreUsageRow) -> CostUsageScanner.CodexUsageRow? {
+        try? JSONDecoder().decode(CostUsageScanner.CodexUsageRow.self, from: value.payload)
     }
 
     private func persistBuffers(path: String, usage: CostUsageFileUsage) {
@@ -1339,6 +1440,9 @@ struct CostUsageStoreLoad: @unchecked Sendable {
     var store: CostUsageStore
     var cache: CostUsageCache
     var receipt: CostUsageStore.CodexBaselineReceipt
+    var unloadedTokenSnapshotPaths: Set<String> = []
+    var unloadedUsageRowPaths: Set<String> = []
+    var legacyTurnIDSummaryPaths: Set<String> = []
 
     func release() {
         self.store.syncReleaseCodexBaseline(self.receipt)
@@ -1357,6 +1461,10 @@ enum CostUsageStoreAccess {
     static func load(cacheRoot: URL?, calendar: Calendar) -> CostUsageStoreLoad {
         let store = CostUsageStore(cacheRoot: cacheRoot)
         return store.syncLoadCodexScan(calendar: calendar)
+    }
+
+    static func loadForScan(cacheRoot: URL?, calendar: Calendar) -> CostUsageStoreLoad {
+        self.load(cacheRoot: cacheRoot, calendar: calendar)
     }
 
     static func read(cacheRoot: URL?, calendar: Calendar = .current) -> CostUsageCache {
@@ -1390,6 +1498,8 @@ enum CostUsageStoreAccess {
         calendar: Calendar,
         requestedScanWindow: (sinceKey: String, untilKey: String),
         reportWindow: (sinceKey: String, untilKey: String)? = nil,
+        unloadedTokenSnapshotPaths: Set<String> = [],
+        unloadedUsageRowPaths: Set<String> = [],
         skipIdenticalContent: Bool = false,
         receipt: CostUsageStore.CodexBaselineReceipt? = nil) -> CostUsageStoreBudgetResult
     {
@@ -1398,6 +1508,8 @@ enum CostUsageStoreAccess {
             calendar: calendar,
             requestedScanWindow: requestedScanWindow,
             reportWindow: reportWindow,
+            unloadedTokenSnapshotPaths: unloadedTokenSnapshotPaths,
+            unloadedUsageRowPaths: unloadedUsageRowPaths,
             skipIdenticalContent: skipIdenticalContent,
             receipt: receipt)
     }

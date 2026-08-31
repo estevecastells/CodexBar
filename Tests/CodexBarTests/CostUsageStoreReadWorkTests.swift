@@ -91,6 +91,642 @@ struct CostUsageStoreReadWorkTests {
     }
 
     @Test
+    func `scanner load and unchanged save skip file histories`() throws {
+        let rowsPerFile = 64
+        let fixture = try ReadWorkFixture(fileCount: 16, rowsPerFile: rowsPerFile)
+        defer { fixture.remove() }
+        let recorder = CostUsageStoreReadWorkRecorder(databaseURL: fixture.store.databaseURL)
+        CostUsageStore.readWorkRecorderForTesting = recorder
+        defer { CostUsageStore.readWorkRecorderForTesting = nil }
+
+        let loaded = CostUsageStoreAccess.loadForScan(
+            cacheRoot: fixture.env.cacheRoot,
+            calendar: fixture.calendar)
+        let loadWork = recorder.snapshot()
+        #expect(loadWork.scannerSnapshotReads == 1)
+        #expect(loadWork.fullSnapshotReads == 0)
+        #expect(loadWork.tokenSnapshotRows == 0)
+        #expect(loadWork.usageRows == 0)
+        #expect(loadWork.usageRowDecodeAttempts == 0)
+        #expect(loaded.unloadedTokenSnapshotPaths.count == fixture.fileCount)
+        #expect(loaded.unloadedUsageRowPaths.count == fixture.fileCount)
+        #expect(loaded.legacyTurnIDSummaryPaths.isEmpty)
+        #expect(loaded.cache.files.values.allSatisfy { $0.codexTokenSnapshots == nil })
+        #expect(loaded.cache.files.values.allSatisfy { $0.codexTurnIDs?.count == rowsPerFile })
+
+        let selectedPath = try #require(loaded.cache.files.keys.min())
+        recorder.reset()
+        let selected = loaded.store.syncLoadCodexTokenSnapshots(paths: Set([selectedPath]))
+        #expect(selected[selectedPath]?.count == rowsPerFile)
+        #expect(recorder.snapshot().tokenSnapshotRows == rowsPerFile)
+        recorder.reset()
+        let selectedRows = loaded.store.syncLoadCodexUsageRows(paths: Set([selectedPath]))
+        #expect(selectedRows[selectedPath]?.count == rowsPerFile)
+        #expect(recorder.snapshot().usageRows == rowsPerFile)
+
+        var refreshed = loaded.cache
+        refreshed.lastScanUnixMs += 1000
+        recorder.reset()
+        let saved = try CostUsageStoreAccess.save(
+            store: loaded.store,
+            cache: refreshed,
+            calendar: fixture.calendar,
+            requestedScanWindow: (
+                sinceKey: #require(refreshed.scanSinceKey),
+                untilKey: #require(refreshed.scanUntilKey)),
+            unloadedTokenSnapshotPaths: loaded.unloadedTokenSnapshotPaths,
+            unloadedUsageRowPaths: loaded.unloadedUsageRowPaths,
+            skipIdenticalContent: true,
+            receipt: loaded.receipt)
+        let saveWork = recorder.snapshot()
+        #expect(!saved.catchUpRequired)
+        #expect(saveWork.scannerSnapshotReads == 0)
+        #expect(saveWork.fullSnapshotReads == 0)
+        #expect(saveWork.tokenSnapshotRows == 0)
+        #expect(saveWork.usageRows == 0)
+        #expect(saveWork.usageRowDecodeAttempts == 0)
+
+        var expected = fixture.canonical
+        expected.lastScanUnixMs = refreshed.lastScanUnixMs
+        #expect(loaded.store.syncLoadCodexCache(calendar: fixture.calendar) == expected)
+
+        let reloaded = CostUsageStoreAccess.loadForScan(
+            cacheRoot: fixture.env.cacheRoot,
+            calendar: fixture.calendar)
+        var partiallyHydrated = reloaded.cache
+        var selectedUsage = try #require(partiallyHydrated.files[selectedPath])
+        let selectedSnapshots = (selected[selectedPath] ?? []).map(CostUsageStore.tokenSnapshot(from:))
+        selectedUsage.codexTokenSnapshots = selectedSnapshots
+        selectedUsage.codexTokenCheckpoints = CostUsageScanner.codexTokenCheckpoints(for: selectedSnapshots)
+        let decodedRows = (selectedRows[selectedPath] ?? []).compactMap(CostUsageStore.usageRow(from:))
+        selectedUsage.codexRows = decodedRows
+        selectedUsage.codexTurnIDs = CostUsageScanner.codexTurnIDs(rows: decodedRows)
+        partiallyHydrated.files[selectedPath] = selectedUsage
+        partiallyHydrated.lastScanUnixMs += 1000
+        var remainingUnloadedPaths = reloaded.unloadedTokenSnapshotPaths
+        remainingUnloadedPaths.remove(selectedPath)
+        var remainingUnloadedUsagePaths = reloaded.unloadedUsageRowPaths
+        remainingUnloadedUsagePaths.remove(selectedPath)
+        recorder.reset()
+        _ = try CostUsageStoreAccess.save(
+            store: reloaded.store,
+            cache: partiallyHydrated,
+            calendar: fixture.calendar,
+            requestedScanWindow: (
+                sinceKey: #require(partiallyHydrated.scanSinceKey),
+                untilKey: #require(partiallyHydrated.scanUntilKey)),
+            unloadedTokenSnapshotPaths: remainingUnloadedPaths,
+            unloadedUsageRowPaths: remainingUnloadedUsagePaths,
+            skipIdenticalContent: true,
+            receipt: reloaded.receipt)
+        let partialSaveWork = recorder.snapshot()
+        #expect(partialSaveWork.scannerSnapshotReads == 0)
+        #expect(partialSaveWork.fullSnapshotReads == 0)
+        #expect(partialSaveWork.tokenSnapshotRows == 0)
+        #expect(partialSaveWork.usageRows == 0)
+        #expect(partialSaveWork.usageRowDecodeAttempts == 0)
+
+        expected.lastScanUnixMs = partiallyHydrated.lastScanUnixMs
+        #expect(reloaded.store.syncLoadCodexCache(calendar: fixture.calendar) == expected)
+    }
+
+    @Test
+    func `pricing migration hydrates exact rows before accepting freshness`() throws {
+        let rowsPerFile = 4
+        let fixture = try ReadWorkFixture(fileCount: 1, rowsPerFile: rowsPerFile)
+        defer { fixture.remove() }
+        let selectedPath = try #require(fixture.canonical.files.keys.min())
+        var baseline = fixture.canonical
+        var selectedUsage = try #require(baseline.files[selectedPath])
+        selectedUsage.codexCostCacheComplete = false
+        selectedUsage.codexRows = selectedUsage.codexRows?.map { row in
+            CostUsageScanner.CodexUsageRow(
+                day: row.day,
+                model: row.model,
+                rawModel: row.rawModel,
+                turnID: row.turnID,
+                eventIndex: row.eventIndex,
+                timestampUnixMs: row.timestampUnixMs,
+                input: row.input,
+                cached: row.cached,
+                output: row.output,
+                reasoning: row.reasoning,
+                knownCostNanos: row.knownCostNanos,
+                unpricedTokens: row.unpricedTokens,
+                pricingModel: nil,
+                pricingMode: nil)
+        }
+        baseline.files[selectedPath] = selectedUsage
+        #expect(!fixture.save(baseline).catchUpRequired)
+
+        let recorder = CostUsageStoreReadWorkRecorder(databaseURL: fixture.store.databaseURL)
+        CostUsageStore.readWorkRecorderForTesting = recorder
+        defer { CostUsageStore.readWorkRecorderForTesting = nil }
+        var options = fixture.options
+        options.refreshMinIntervalSeconds = 0
+
+        let report = CostUsageScanner.loadDailyReport(
+            provider: .codex,
+            since: fixture.now,
+            until: fixture.now,
+            now: fixture.now.addingTimeInterval(1),
+            options: options)
+        let work = recorder.snapshot()
+
+        #expect(report.summary?.totalTokens == fixture.rowCount * 13)
+        #expect(work.tokenSnapshotRows >= rowsPerFile)
+        #expect(work.usageRows >= rowsPerFile)
+        #expect(work.usageRowDecodeAttempts >= rowsPerFile)
+        let migrated = fixture.store.syncLoadCodexCache(calendar: fixture.calendar).files[selectedPath]
+        #expect(migrated?.codexCostCacheComplete == true)
+        #expect(migrated?.codexRows?.allSatisfy { $0.pricingModel == $0.model && $0.pricingMode == "standard" } == true)
+    }
+
+    @Test
+    func `history read failures retain unloaded markers and persisted rows`() async throws {
+        let fixture = try ReadWorkFixture(fileCount: 2, rowsPerFile: 4)
+        defer { fixture.remove() }
+        let before = await fixture.store.readSnapshot()
+        let loaded = CostUsageStoreAccess.loadForScan(
+            cacheRoot: fixture.env.cacheRoot,
+            calendar: fixture.calendar)
+        let selectedPath = try #require(loaded.cache.files.keys.min())
+        let databaseURL = fixture.store.databaseURL
+        CostUsageStore.codexTokenSnapshotReadFailureForTesting = { $0 == databaseURL && $1 == selectedPath }
+        CostUsageStore.codexUsageRowReadFailureForTesting = { $0 == databaseURL && $1 == selectedPath }
+        defer {
+            CostUsageStore.codexTokenSnapshotReadFailureForTesting = nil
+            CostUsageStore.codexUsageRowReadFailureForTesting = nil
+        }
+
+        let history = CostUsageScanner.CodexScanHistoryHydrator(load: loaded)
+        var cache = loaded.cache
+        let hydrated = history.hydrate(
+            for: [URL(fileURLWithPath: selectedPath)],
+            cache: &cache)
+        #expect(hydrated.isEmpty)
+        #expect(history.unloadedTokenPaths.contains(selectedPath))
+        #expect(history.unloadedUsagePaths.contains(selectedPath))
+        #expect(cache.files[selectedPath]?.codexTokenSnapshots == nil)
+        #expect(cache.files[selectedPath]?.codexRowsAreUnloaded == true)
+
+        cache.lastScanUnixMs += 1000
+        let result = try CostUsageStoreAccess.save(
+            store: loaded.store,
+            cache: cache,
+            calendar: fixture.calendar,
+            requestedScanWindow: (
+                sinceKey: #require(cache.scanSinceKey),
+                untilKey: #require(cache.scanUntilKey)),
+            unloadedTokenSnapshotPaths: history.unloadedTokenPaths,
+            unloadedUsageRowPaths: history.unloadedUsagePaths,
+            skipIdenticalContent: true)
+        #expect(!result.catchUpRequired)
+
+        CostUsageStore.codexTokenSnapshotReadFailureForTesting = nil
+        CostUsageStore.codexUsageRowReadFailureForTesting = nil
+        let after = await fixture.store.readSnapshot()
+        #expect(after.tokenSnapshots == before.tokenSnapshots)
+        #expect(after.usageRows == before.usageRows)
+    }
+
+    @Test(arguments: [true, false])
+    func `scanner defers changed files when history reads fail`(failTokenRead: Bool) async throws {
+        let fixture = try ReadWorkFixture(fileCount: 1, rowsPerFile: 4)
+        defer { fixture.remove() }
+        let selectedPath = try #require(fixture.canonical.files.keys.min())
+        let originalUsage = try #require(fixture.canonical.files[selectedPath])
+        let before = await fixture.store.readSnapshot()
+        let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: selectedPath))
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{}\n".utf8))
+        try handle.close()
+        let changedMetadata = CostUsageScanner.codexFileMetadata(fileURL: URL(fileURLWithPath: selectedPath))
+        #expect(changedMetadata.size > originalUsage.size)
+
+        let databaseURL = fixture.store.databaseURL
+        CostUsageStore.codexTokenSnapshotReadFailureForTesting = {
+            failTokenRead && $0 == databaseURL && $1 == selectedPath
+        }
+        CostUsageStore.codexUsageRowReadFailureForTesting = {
+            !failTokenRead && $0 == databaseURL && $1 == selectedPath
+        }
+        defer {
+            CostUsageStore.codexTokenSnapshotReadFailureForTesting = nil
+            CostUsageStore.codexUsageRowReadFailureForTesting = nil
+        }
+        var options = fixture.options
+        options.refreshMinIntervalSeconds = 0
+
+        let report = CostUsageScanner.loadDailyReport(
+            provider: .codex,
+            since: fixture.now,
+            until: fixture.now,
+            now: fixture.now.addingTimeInterval(1),
+            options: options)
+        CostUsageStore.codexTokenSnapshotReadFailureForTesting = nil
+        CostUsageStore.codexUsageRowReadFailureForTesting = nil
+
+        #expect(report.summary?.totalTokens == fixture.rowCount * 13)
+        let deferred = fixture.store.syncLoadCodexCache(calendar: fixture.calendar)
+        #expect(deferred.files[selectedPath]?.size == originalUsage.size)
+        #expect(deferred.files[selectedPath]?.mtimeUnixMs == originalUsage.mtimeUnixMs)
+        #expect(deferred.codexScanCatchUpPending == true)
+        let after = await fixture.store.readSnapshot()
+        #expect(after.tokenSnapshots == before.tokenSnapshots)
+        #expect(after.usageRows == before.usageRows)
+    }
+
+    @Test(arguments: [true, false])
+    func `alias migration defers on history failure then retries losslessly`(failTokenRead: Bool) async throws {
+        let fixture = try ReadWorkFixture(fileCount: 2, rowsPerFile: 4)
+        defer { fixture.remove() }
+        let oldPath = try #require(fixture.canonical.files.keys.min())
+        let newURL = fixture.env.codexSessionsRoot.appendingPathComponent("renamed-after-failure.jsonl")
+        let before = await fixture.store.readSnapshot()
+        try FileManager.default.moveItem(at: URL(fileURLWithPath: oldPath), to: newURL)
+
+        let databaseURL = fixture.store.databaseURL
+        CostUsageStore.codexTokenSnapshotReadFailureForTesting = {
+            failTokenRead && $0 == databaseURL && $1 == oldPath
+        }
+        CostUsageStore.codexUsageRowReadFailureForTesting = {
+            !failTokenRead && $0 == databaseURL && $1 == oldPath
+        }
+        defer {
+            CostUsageStore.codexTokenSnapshotReadFailureForTesting = nil
+            CostUsageStore.codexUsageRowReadFailureForTesting = nil
+        }
+        var options = fixture.options
+        options.refreshMinIntervalSeconds = 0
+
+        let deferredReport = CostUsageScanner.loadDailyReport(
+            provider: .codex,
+            since: fixture.now,
+            until: fixture.now,
+            now: fixture.now.addingTimeInterval(1),
+            options: options)
+        CostUsageStore.codexTokenSnapshotReadFailureForTesting = nil
+        CostUsageStore.codexUsageRowReadFailureForTesting = nil
+
+        #expect(deferredReport.summary?.totalTokens == fixture.rowCount * 13)
+        let deferred = fixture.store.syncLoadCodexCache(calendar: fixture.calendar)
+        #expect(deferred.files[oldPath] != nil)
+        #expect(deferred.files[newURL.path] == nil)
+        let afterFailure = await fixture.store.readSnapshot()
+        #expect(afterFailure.tokenSnapshots == before.tokenSnapshots)
+        #expect(afterFailure.usageRows == before.usageRows)
+
+        let retriedReport = CostUsageScanner.loadDailyReport(
+            provider: .codex,
+            since: fixture.now,
+            until: fixture.now,
+            now: fixture.now.addingTimeInterval(2),
+            options: options)
+        #expect(retriedReport.summary?.totalTokens == fixture.rowCount * 13)
+        let migrated = fixture.store.syncLoadCodexCache(calendar: fixture.calendar)
+        #expect(migrated.files[oldPath] == nil)
+        #expect(migrated.files[newURL.path]?.codexTokenSnapshots?.count == 4)
+        #expect(migrated.files[newURL.path]?.codexRows?.count == 4)
+    }
+
+    @Test
+    func `scanner preserves legacy turn ID summaries until rows hydrate`() async throws {
+        let fixture = try ReadWorkFixture(fileCount: 2, rowsPerFile: 4)
+        defer { fixture.remove() }
+        let path = try #require(fixture.canonical.files.keys.min())
+        var file = try #require(await fixture.store.fetchFile(path: path))
+        let payload = try #require(file.scanState.detailsPayload)
+        var details = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        details.removeValue(forKey: "turnIDs")
+        file.scanState.detailsPayload = try JSONSerialization.data(withJSONObject: details)
+        #expect(await fixture.store.upsertFile(file))
+
+        let loaded = CostUsageStoreAccess.loadForScan(
+            cacheRoot: fixture.env.cacheRoot,
+            calendar: fixture.calendar)
+        #expect(loaded.legacyTurnIDSummaryPaths == Set([path]))
+        #expect(loaded.cache.files[path]?.codexTurnIDs == [])
+        #expect(loaded.cache.files[path]?.codexTurnIDsAreUnloaded == true)
+
+        var refreshed = loaded.cache
+        refreshed.lastScanUnixMs += 1000
+        let result = try CostUsageStoreAccess.save(
+            store: loaded.store,
+            cache: refreshed,
+            calendar: fixture.calendar,
+            requestedScanWindow: (
+                sinceKey: #require(refreshed.scanSinceKey),
+                untilKey: #require(refreshed.scanUntilKey)),
+            unloadedTokenSnapshotPaths: loaded.unloadedTokenSnapshotPaths,
+            unloadedUsageRowPaths: loaded.unloadedUsageRowPaths,
+            skipIdenticalContent: true,
+            receipt: loaded.receipt)
+        #expect(!result.catchUpRequired)
+
+        var expected = fixture.canonical
+        expected.lastScanUnixMs = refreshed.lastScanUnixMs
+        #expect(loaded.store.syncLoadCodexCache(calendar: fixture.calendar) == expected)
+
+        let recorder = CostUsageStoreReadWorkRecorder(databaseURL: loaded.store.databaseURL)
+        CostUsageStore.readWorkRecorderForTesting = recorder
+        defer { CostUsageStore.readWorkRecorderForTesting = nil }
+        var options = fixture.options
+        options.refreshMinIntervalSeconds = 0
+        _ = CostUsageScanner.loadDailyReport(
+            provider: .codex,
+            since: fixture.now,
+            until: fixture.now,
+            now: fixture.now.addingTimeInterval(1),
+            options: options)
+        let work = recorder.snapshot()
+        #expect(work.tokenSnapshotRows == 0)
+        #expect(work.usageRows == 0)
+        #expect(work.usageRowDecodeAttempts == 0)
+    }
+
+    #if canImport(SQLite3)
+    @Test
+    func `legacy turn summaries avoid history loads for unrelated priority changes`() async throws {
+        let rowsPerFile = 64
+        let fixture = try ReadWorkFixture(fileCount: 16, rowsPerFile: rowsPerFile)
+        defer { fixture.remove() }
+        let databaseURL = try #require(fixture.options.codexTraceDatabaseURL)
+        try CostUsageScannerCodexPriorityTests.createTestLogsDatabase(at: databaseURL)
+        CostUsageScanner._test_resetCodexPriorityTurnsMemo(forPath: databaseURL.path)
+        defer { CostUsageScanner._test_resetCodexPriorityTurnsMemo(forPath: databaseURL.path) }
+
+        var baseline = fixture.canonical
+        baseline.codexPriorityMetadataKey = "sqlite:\(databaseURL.standardizedFileURL.path)"
+        baseline.codexPriorityTurnKeys = [:]
+        baseline.codexPriorityTurnIDsByDay = [:]
+        #expect(!fixture.save(baseline).catchUpRequired)
+        for path in baseline.files.keys {
+            var file = try #require(await fixture.store.fetchFile(path: path))
+            let payload = try #require(file.scanState.detailsPayload)
+            var details = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+            details.removeValue(forKey: "turnIDs")
+            file.scanState.detailsPayload = try JSONSerialization.data(withJSONObject: details)
+            #expect(await fixture.store.upsertFile(file))
+        }
+        try CostUsageScannerCodexPriorityTests.insertTestLog(
+            dbURL: databaseURL,
+            epochSeconds: Int64(fixture.now.timeIntervalSince1970),
+            body: "thread_id=external turn.id=unrelated-priority-turn websocket request: " +
+                #"{"type":"response.create","model":"gpt-5.4","service_tier":"priority"}"#)
+
+        let recorder = CostUsageStoreReadWorkRecorder(databaseURL: fixture.store.databaseURL)
+        CostUsageStore.readWorkRecorderForTesting = recorder
+        defer { CostUsageStore.readWorkRecorderForTesting = nil }
+        let scanRecorder = CostUsageScanner.CodexScanWorkRecorder()
+        var options = fixture.options
+        options.refreshMinIntervalSeconds = 0
+        options.codexScanWorkRecorderForTesting = scanRecorder
+
+        let report = CostUsageScanner.loadDailyReport(
+            provider: .codex,
+            since: fixture.now,
+            until: fixture.now,
+            now: fixture.now.addingTimeInterval(1),
+            options: options)
+        let work = recorder.snapshot()
+        CostUsageStore.readWorkRecorderForTesting = nil
+
+        #expect(report.summary?.totalTokens == fixture.rowCount * 13)
+        #expect(work.tokenSnapshotRows == 0)
+        #expect(work.usageRows == 0)
+        #expect(work.usageRowDecodeAttempts == 0)
+        let scanWork = scanRecorder.snapshot()
+        #expect(scanWork.usageRowsProcessed == 0)
+        #expect(scanWork.usageRowsRepriced == 0)
+        let reloaded = CostUsageStoreAccess.loadForScan(
+            cacheRoot: fixture.env.cacheRoot,
+            calendar: fixture.calendar)
+        #expect(reloaded.legacyTurnIDSummaryPaths.isEmpty)
+        #expect(reloaded.cache.files.values.allSatisfy { $0.codexTurnIDs?.count == rowsPerFile })
+    }
+    #endif
+
+    @Test
+    func `debounced scanner refresh skips file histories end to end`() throws {
+        let fixture = try ReadWorkFixture(fileCount: 16, rowsPerFile: 64)
+        defer { fixture.remove() }
+        let recorder = CostUsageStoreReadWorkRecorder(databaseURL: fixture.store.databaseURL)
+        CostUsageStore.readWorkRecorderForTesting = recorder
+        defer { CostUsageStore.readWorkRecorderForTesting = nil }
+
+        let report = CostUsageScanner.loadDailyReport(
+            provider: .codex,
+            since: fixture.now,
+            until: fixture.now,
+            now: fixture.now.addingTimeInterval(1),
+            options: fixture.options)
+        let work = recorder.snapshot()
+        #expect(report.summary?.totalTokens == fixture.rowCount * 13)
+        #expect(work.scannerSnapshotReads == 1)
+        #expect(work.tokenSnapshotRows == 0)
+        #expect(work.usageRows == 0)
+        #expect(work.usageRowDecodeAttempts == 0)
+    }
+
+    @Test
+    func `routine scanner refresh skips unchanged file histories end to end`() throws {
+        let fixture = try ReadWorkFixture(fileCount: 16, rowsPerFile: 64)
+        defer { fixture.remove() }
+        let recorder = CostUsageStoreReadWorkRecorder(databaseURL: fixture.store.databaseURL)
+        CostUsageStore.readWorkRecorderForTesting = recorder
+        defer { CostUsageStore.readWorkRecorderForTesting = nil }
+        var options = fixture.options
+        options.refreshMinIntervalSeconds = 0
+
+        let report = CostUsageScanner.loadDailyReport(
+            provider: .codex,
+            since: fixture.now,
+            until: fixture.now,
+            now: fixture.now.addingTimeInterval(1),
+            options: options)
+        let work = recorder.snapshot()
+        #expect(report.summary?.totalTokens == fixture.rowCount * 13)
+        #expect(work.scannerSnapshotReads == 1)
+        #expect(work.tokenSnapshotRows == 0)
+        #expect(work.usageRows == 0)
+        #expect(work.usageRowDecodeAttempts == 0)
+    }
+
+    @Test
+    func `renamed session preserves lazily loaded histories`() throws {
+        let rowsPerFile = 4
+        let fixture = try ReadWorkFixture(fileCount: 2, rowsPerFile: rowsPerFile)
+        defer { fixture.remove() }
+        let oldPath = try #require(fixture.canonical.files.keys.min())
+        let newURL = fixture.env.codexSessionsRoot.appendingPathComponent("renamed-session.jsonl")
+        try FileManager.default.moveItem(at: URL(fileURLWithPath: oldPath), to: newURL)
+
+        let recorder = CostUsageStoreReadWorkRecorder(databaseURL: fixture.store.databaseURL)
+        CostUsageStore.readWorkRecorderForTesting = recorder
+        defer { CostUsageStore.readWorkRecorderForTesting = nil }
+        var options = fixture.options
+        options.refreshMinIntervalSeconds = 0
+
+        let report = CostUsageScanner.loadDailyReport(
+            provider: .codex,
+            since: fixture.now,
+            until: fixture.now,
+            now: fixture.now.addingTimeInterval(1),
+            options: options)
+        let work = recorder.snapshot()
+        CostUsageStore.readWorkRecorderForTesting = nil
+
+        #expect(report.summary?.totalTokens == fixture.rowCount * 13)
+        #expect(work.tokenSnapshotRows == rowsPerFile)
+        #expect(work.usageRows == rowsPerFile)
+        let persisted = fixture.store.syncLoadCodexCache(calendar: fixture.calendar)
+        #expect(persisted.files[oldPath] == nil)
+        #expect(persisted.files[newURL.path]?.codexTokenSnapshots?.count == rowsPerFile)
+        #expect(persisted.files[newURL.path]?.codexRows?.count == rowsPerFile)
+        #expect(persisted.files[newURL.path]?.days == fixture.canonical.files[oldPath]?.days)
+    }
+
+    @Test
+    func `new fork child hydrates only its cached parent history`() throws {
+        let env = try CostUsageTestEnvironment()
+        defer { env.cleanup() }
+        let day = try env.makeLocalNoon(year: 2026, month: 5, day: 10)
+        let iso = env.isoString(for: day)
+        let forkISO = env.isoString(for: day.addingTimeInterval(2))
+        let model = "openai/gpt-5.2-codex"
+        let parentURL = try env.writeCodexSessionFile(
+            day: day,
+            filename: "cached-parent.jsonl",
+            contents: [
+                #"{"type":"session_meta","timestamp":"\#(iso)","payload":{"session_id":"cached-parent"}}"#,
+                #"{"type":"turn_context","timestamp":"\#(iso)","payload":{"model":"\#(model)"}}"#,
+                #"{"type":"event_msg","timestamp":"\#(forkISO)","payload":{"type":"token_count","info":"#
+                    + #"{"total_token_usage":{"input_tokens":500,"cached_input_tokens":50,"output_tokens":25},"#
+                    + #""model":"\#(model)"}}}"#,
+            ].joined(separator: "\n") + "\n")
+        _ = try env.writeCodexSessionFile(
+            day: day,
+            filename: "unrelated.jsonl",
+            contents: [
+                #"{"type":"session_meta","timestamp":"\#(iso)","payload":{"session_id":"unrelated"}}"#,
+                #"{"type":"turn_context","timestamp":"\#(iso)","payload":{"model":"\#(model)"}}"#,
+                #"{"type":"event_msg","timestamp":"\#(iso)","payload":{"type":"token_count","info":"#
+                    + #"{"last_token_usage":{"input_tokens":40,"cached_input_tokens":4,"output_tokens":2},"#
+                    + #""model":"\#(model)"}}}"#,
+            ].joined(separator: "\n") + "\n")
+        var options = CostUsageScanner.Options(
+            codexSessionsRoot: env.codexSessionsRoot,
+            claudeProjectsRoots: nil,
+            cacheRoot: env.cacheRoot,
+            codexTraceDatabaseURL: env.root.appendingPathComponent("missing.sqlite"),
+            maxCodexSessionFileBytes: 0,
+            maxCodexScanBytesPerRefresh: 0)
+        options.refreshMinIntervalSeconds = 0
+        _ = CostUsageScanner.loadDailyReport(
+            provider: .codex,
+            since: day,
+            until: day,
+            now: day,
+            options: options)
+
+        let childURL = try env.writeCodexSessionFile(
+            day: day,
+            filename: "new-child.jsonl",
+            contents: [
+                #"{"type":"session_meta","timestamp":"\#(forkISO)","payload":{"session_id":"new-child","#
+                    + #""forked_from_id":"cached-parent"}}"#,
+                #"{"type":"turn_context","timestamp":"\#(forkISO)","payload":{"model":"\#(model)"}}"#,
+                #"{"type":"event_msg","timestamp":"\#(forkISO)","payload":{"type":"token_count","info":"#
+                    + #"{"total_token_usage":{"input_tokens":600,"cached_input_tokens":60,"output_tokens":30},"#
+                    + #""model":"\#(model)"}}}"#,
+            ].joined(separator: "\n") + "\n")
+        try FileManager.default.setAttributes(
+            [.modificationDate: day],
+            ofItemAtPath: parentURL.path)
+        try FileManager.default.setAttributes(
+            [.modificationDate: day.addingTimeInterval(120)],
+            ofItemAtPath: childURL.path)
+
+        var baselineOptions = options
+        baselineOptions.cacheRoot = env.root.appendingPathComponent("baseline-cache")
+        let baselineReport = CostUsageScanner.loadDailyReport(
+            provider: .codex,
+            since: day,
+            until: day,
+            now: day.addingTimeInterval(120),
+            options: baselineOptions)
+        let baselineCache = CostUsageStoreAccess.read(cacheRoot: baselineOptions.cacheRoot)
+
+        let store = CostUsageStore(cacheRoot: env.cacheRoot)
+        let recorder = CostUsageStoreReadWorkRecorder(databaseURL: store.databaseURL)
+        CostUsageStore.readWorkRecorderForTesting = recorder
+        defer { CostUsageStore.readWorkRecorderForTesting = nil }
+        let incrementalReport = CostUsageScanner.loadDailyReport(
+            provider: .codex,
+            since: day,
+            until: day,
+            now: day.addingTimeInterval(120),
+            options: options)
+        let work = recorder.snapshot()
+        CostUsageStore.readWorkRecorderForTesting = nil
+        let incrementalCache = CostUsageStoreAccess.read(cacheRoot: env.cacheRoot)
+        let baselineChild = try #require(baselineCache.files.values.first { $0.sessionId == "new-child" })
+        let incrementalChild = try #require(incrementalCache.files.values.first { $0.sessionId == "new-child" })
+
+        #expect(incrementalReport.summary?.totalTokens == baselineReport.summary?.totalTokens)
+        #expect(incrementalChild.days == baselineChild.days)
+        #expect(incrementalChild.forkBaselineDependencyKey?.hasPrefix("file|cached-parent|") == true)
+        #expect(work.tokenSnapshotRows == 1)
+        #expect(work.usageRows == 1)
+        #expect(work.usageRowDecodeAttempts == 1)
+    }
+
+    @Test
+    func `metadata save preserves unloaded histories and aggregates`() async throws {
+        let fixture = try ReadWorkFixture(fileCount: 16, rowsPerFile: 64)
+        defer { fixture.remove() }
+        let before = await fixture.store.readSnapshot()
+        let recorder = CostUsageStoreReadWorkRecorder(databaseURL: fixture.store.databaseURL)
+        CostUsageStore.readWorkRecorderForTesting = recorder
+        defer { CostUsageStore.readWorkRecorderForTesting = nil }
+        let loaded = CostUsageStoreAccess.loadForScan(
+            cacheRoot: fixture.env.cacheRoot,
+            calendar: fixture.calendar)
+        var changed = loaded.cache
+        changed.codexProjectMetadataVersion = (changed.codexProjectMetadataVersion ?? 0) + 1
+
+        recorder.reset()
+        let result = try CostUsageStoreAccess.save(
+            store: loaded.store,
+            cache: changed,
+            calendar: fixture.calendar,
+            requestedScanWindow: (
+                sinceKey: #require(changed.scanSinceKey),
+                untilKey: #require(changed.scanUntilKey)),
+            unloadedTokenSnapshotPaths: loaded.unloadedTokenSnapshotPaths,
+            unloadedUsageRowPaths: loaded.unloadedUsageRowPaths,
+            skipIdenticalContent: true,
+            receipt: loaded.receipt)
+        let work = recorder.snapshot()
+        #expect(!result.catchUpRequired)
+        #expect(work.scannerSnapshotReads == 0)
+        #expect(work.tokenSnapshotRows == 0)
+        #expect(work.usageRows == 0)
+        #expect(work.usageRowDecodeAttempts == 0)
+
+        let after = await fixture.store.readSnapshot()
+        #expect(after.tokenSnapshots == before.tokenSnapshots)
+        #expect(after.usageRows == before.usageRows)
+        #expect(after.fileDayAggregates == before.fileDayAggregates)
+        #expect(after.dayAggregates == before.dayAggregates)
+        #expect(after.accumulators == before.accumulators)
+        var expected = fixture.canonical
+        expected.codexProjectMetadataVersion = changed.codexProjectMetadataVersion
+        #expect(fixture.store.syncLoadCodexCache(calendar: fixture.calendar) == expected)
+    }
+
+    @Test
     func `recorder excludes other database paths and preserves read results`() async throws {
         let observed = try ReadWorkFixture(fileCount: 2, rowsPerFile: 4)
         defer { observed.remove() }
@@ -402,6 +1038,7 @@ struct ReadWorkFixture {
                 pricingModel: Self.model,
                 pricingMode: "standard")
         }
+        usage.codexTurnIDs = CostUsageScanner.codexTurnIDs(rows: usage.codexRows ?? [])
         usage.codexTokenSnapshots = (0..<rowCount).map { event in
             CostUsageCodexTokenSnapshot(
                 timestamp: timestamp,

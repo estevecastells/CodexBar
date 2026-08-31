@@ -480,6 +480,9 @@ extension CostUsageScanner {
     }
 
     static func cachedCodexRowsNeedIdentityRescan(_ usage: CostUsageFileUsage) -> Bool {
+        if usage.codexRowsAreUnloaded == true {
+            return false
+        }
         let rows = usage.codexRows ?? []
         return (!usage.days.isEmpty && rows.isEmpty) || Self.codexRowsNeedIdentityRescan(rows)
     }
@@ -747,6 +750,7 @@ extension CostUsageScanner {
             context.resources.fileIndex.remember(fileURL: input.fileURL, sessionId: sessionId)
             if session.contributedUsage {
                 state.contributingSessionIds.insert(sessionId)
+                state.contributingFilePathsBySessionID[sessionId, default: []].insert(input.metadata.path)
             }
         }
         Self.rememberCodexRows(
@@ -834,6 +838,9 @@ extension CostUsageScanner {
         _ cached: CostUsageFileUsage,
         context: CodexFileScanContext) -> Bool
     {
+        if cached.codexTurnIDsAreUnloaded == true {
+            return !context.changedPriorityTurnIDs.isEmpty
+        }
         if cached.codexTurnIDs == nil {
             return context.requiresTurnIDCache
         }
@@ -1011,6 +1018,14 @@ extension CostUsageScanner {
             context.resources.projectPathResolver.canonicalProjectPath(for: $0)
         } ?? cached.canonicalProjectPath ?? context.resources.projectPathResolver.canonicalProjectPath(for: projectPath)
         let sessionAlreadyContributed = sessionId.map { state.contributingSessionIds.contains($0) } ?? false
+        if sessionAlreadyContributed, let sessionId {
+            guard Self.prepareCodexRowDeduplication(
+                sessionId: sessionId,
+                context: context,
+                cache: &cache,
+                state: &state)
+            else { return false }
+        }
         let cachedRows = cached.codexRows ?? []
         let retainedCachedRows: [CodexUsageRow]
         if sessionAlreadyContributed {
@@ -1145,12 +1160,9 @@ extension CostUsageScanner {
         context: CodexFileScanContext,
         cache: inout CostUsageCache,
         state: inout CodexScanState,
-        maxBytesToRead: Int64? = nil) throws
+        maxBytesToRead: Int64? = nil) throws -> Bool
     {
         try context.checkCancellation?()
-        if let cached = input.cached {
-            self.applyFileDays(cache: &cache, fileDays: cached.days, sign: -1)
-        }
         let migratedCached = input.cached.map { Self.codexFileUsageWithPricingMetadata($0, context: context) }
         var usageDays = context.dropDeferredCodexRows
             ? [:]
@@ -1183,6 +1195,17 @@ extension CostUsageScanner {
             context.resources.projectPathResolver.canonicalProjectPath(for: $0)
         } ?? input.cached?.canonicalProjectPath ?? context.resources.projectPathResolver
             .canonicalProjectPath(for: projectPath)
+        if let sessionId, state.contributingSessionIds.contains(sessionId) {
+            guard Self.prepareCodexRowDeduplication(
+                sessionId: sessionId,
+                context: context,
+                cache: &cache,
+                state: &state)
+            else { return false }
+        }
+        if let cached = input.cached {
+            self.applyFileDays(cache: &cache, fileDays: cached.days, sign: -1)
+        }
         let uniqueRows = Self.uniqueCodexRows(
             rows: parsed.rows,
             sessionId: sessionId,
@@ -1197,7 +1220,7 @@ extension CostUsageScanner {
            parsed.bufferedUnresolvedForkLines == nil
         {
             cache.files.removeValue(forKey: input.metadata.path)
-            return
+            return true
         }
         let uniqueDays = Self.codexFileDays(rows: uniqueRows)
         Self.mergeFileDays(existing: &usageDays, delta: uniqueDays)
@@ -1278,6 +1301,7 @@ extension CostUsageScanner {
             rows: uniqueRows,
             context: context,
             state: &state)
+        return true
     }
 
     static func codexForkBaselineDependencyKey(

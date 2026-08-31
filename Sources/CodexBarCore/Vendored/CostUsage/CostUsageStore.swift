@@ -80,6 +80,7 @@ actor CostUsageStore {
         parserHash: CodexParserHash.value)
     static let cacheGeneration = "sqlite:\(CostUsageStore.schemaVersion)"
     static let compatiblePredecessorParserHashes: Set<String> = [
+        "6366caa15c925349", // Decoded scan baselines before lazy history materialization.
         "4a593b5d59c7bcf3", // Scan receipt wiring preserves parsing and persisted rows.
         "b77d4ec72e14ea63", // Timestamp and append validation optimization preserves native rows and checkpoints.
         "7b1b44d62a411215", // Test-only trace isolation leaves production parsing and stored history unchanged.
@@ -116,6 +117,9 @@ actor CostUsageStore {
 
     /// Test-only traversal proof for persisted Codex catch-up reconciliation. Never set in production.
     nonisolated(unsafe) static var codexCatchUpReconciliationVisitForTesting: (() -> Void)?
+    /// Test-only read failures scoped by database and path. Never set in production.
+    nonisolated(unsafe) static var codexTokenSnapshotReadFailureForTesting: ((URL, String) -> Bool)?
+    nonisolated(unsafe) static var codexUsageRowReadFailureForTesting: ((URL, String) -> Bool)?
 
     /// Process-wide serialization keeps every writable store connection on the same queue.
     /// This matches the scan pipeline's single-writer contract without multiplying executor
@@ -196,6 +200,52 @@ extension CostUsageStore {
         }
     }
 
+    nonisolated func syncLoadCodexTokenSnapshots(
+        paths: Set<String>) -> [String: [CostUsageStoreTokenSnapshot]]
+    {
+        self.syncLoadCodexTokenSnapshotsIfAvailable(paths: paths) ?? [:]
+    }
+
+    nonisolated func syncLoadCodexTokenSnapshotsIfAvailable(
+        paths: Set<String>) -> [String: [CostUsageStoreTokenSnapshot]]?
+    {
+        self.syncWithStoreIsolation { store in
+            var snapshots: [String: [CostUsageStoreTokenSnapshot]] = [:]
+            for path in paths.sorted() {
+                guard let values = store.fetchTokenSnapshotsIfAvailable(path: path) else { return nil }
+                snapshots[path] = values
+            }
+            return snapshots
+        }
+    }
+
+    nonisolated func syncLoadCodexUsageRows(
+        paths: Set<String>) -> [String: [CostUsageStoreUsageRow]]
+    {
+        self.syncLoadCodexUsageRowsIfAvailable(paths: paths) ?? [:]
+    }
+
+    nonisolated func syncLoadCodexUsageRowsIfAvailable(
+        paths: Set<String>) -> [String: [CostUsageStoreUsageRow]]?
+    {
+        self.syncWithStoreIsolation { store in
+            var rows: [String: [CostUsageStoreUsageRow]] = [:]
+            for path in paths.sorted() {
+                guard let values = store.fetchUsageRowsIfAvailable(path: path) else { return nil }
+                rows[path] = values
+            }
+            store.scopedReadWorkRecorderForTesting?.recordUsageRowDecodes(
+                count: rows.values.reduce(0) { $0 + $1.count })
+            return rows
+        }
+    }
+
+    nonisolated func syncLoadCodexTurnIDs(paths: Set<String>) -> [String: Set<String>]? {
+        self.syncWithStoreIsolation { store in
+            store.fetchCodexTurnIDs(paths: paths)
+        }
+    }
+
     nonisolated func syncLoadCodexReadView(
         calendar: Calendar,
         purpose: CostUsageStoreReadPurpose) -> CostUsageStoreReadView
@@ -212,6 +262,8 @@ extension CostUsageStore {
         reportWindow: (sinceKey: String, untilKey: String)? = nil,
         rowBudget: Int = CostUsageStore.defaultRowBudget,
         fileBudgetBytes: Int64 = CostUsageStore.defaultFileBudgetBytes,
+        unloadedTokenSnapshotPaths: Set<String> = [],
+        unloadedUsageRowPaths: Set<String> = [],
         skipIdenticalContent: Bool = false,
         receipt: CodexBaselineReceipt? = nil) -> CostUsageStoreBudgetResult
     {
@@ -223,6 +275,8 @@ extension CostUsageStore {
                 reportWindow: reportWindow,
                 rowBudget: rowBudget,
                 fileBudgetBytes: fileBudgetBytes,
+                unloadedTokenSnapshotPaths: unloadedTokenSnapshotPaths,
+                unloadedUsageRowPaths: unloadedUsageRowPaths,
                 skipIdenticalContent: skipIdenticalContent,
                 receipt: receipt)
         }

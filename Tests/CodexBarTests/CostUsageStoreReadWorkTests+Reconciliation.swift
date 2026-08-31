@@ -84,10 +84,14 @@ extension CostUsageStoreReadWorkTests {
         incoming.lastScanUnixMs += 1000
         #expect(!fixture.save(incoming, receipt: loaded.receipt).catchUpRequired)
         #expect(await fixture.store.persistenceWriteMetricsForTesting().rows - before.rows == 2)
-        #expect(recorder.snapshot().fullSnapshotReads == 1)
-        #expect(recorder.snapshot().usageRowDecodeAttempts == fixture.rowCount)
+        #expect(recorder.snapshot().fullSnapshotReads == 0)
+        #expect(recorder.snapshot().scannerSnapshotReads == 1)
+        #expect(recorder.snapshot().usageRowDecodeAttempts == 0)
         #expect(recorder.snapshot().aggregateGroupingRowVisits == 0)
-        #expect(fixture.store.syncLoadCodexCache(calendar: fixture.calendar) == incoming)
+        let persisted = fixture.store.syncLoadCodexCache(calendar: fixture.calendar)
+        #expect(persisted.lastScanUnixMs == incoming.lastScanUnixMs)
+        #expect(persisted.codexPriorityTurnsCursor == incoming.codexPriorityTurnsCursor)
+        #expect(persisted.files == fixture.canonical.files)
     }
 
     @Test
@@ -118,9 +122,10 @@ extension CostUsageStoreReadWorkTests {
         let unchanged = scan(day.addingTimeInterval(1))
         #expect(unchanged.data == original.data)
         #expect(unchanged.summary == original.summary)
-        #expect(recorder.snapshot().fullSnapshotReads == 1)
+        #expect(recorder.snapshot().fullSnapshotReads == 0)
+        #expect(recorder.snapshot().scannerSnapshotReads == 1)
         #expect(recorder.snapshot().cacheConversions == 1)
-        #expect(recorder.snapshot().usageRowDecodeAttempts == 1)
+        #expect(recorder.snapshot().usageRowDecodeAttempts == 0)
         #expect(recorder.snapshot().aggregateGroupingRowVisits == 0)
     }
 }
