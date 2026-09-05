@@ -21,61 +21,14 @@ extension CostUsageStore {
     }
 
     func fetchTokenSnapshots(path: String) -> [CostUsageStoreTokenSnapshot] {
-        self.fetchTokenSnapshotsIfAvailable(path: path) ?? []
-    }
-
-    func fetchTokenSnapshotsIfAvailable(path: String) -> [CostUsageStoreTokenSnapshot]? {
-        if Self.codexTokenSnapshotReadFailureForTesting?(self.databaseURL, path) == true { return nil }
-        return self.withDatabase(default: nil) { database in
+        self.withDatabase(default: []) { database in
             try Self.readTokenSnapshots(database, path: path, recorder: self.scopedReadWorkRecorderForTesting)
         }
     }
 
     func fetchUsageRows(path: String) -> [CostUsageStoreUsageRow] {
-        self.fetchUsageRowsIfAvailable(path: path) ?? []
-    }
-
-    func fetchUsageRowsIfAvailable(path: String) -> [CostUsageStoreUsageRow]? {
-        if Self.codexUsageRowReadFailureForTesting?(self.databaseURL, path) == true { return nil }
-        return self.withDatabase(default: nil) { database in
+        self.withDatabase(default: []) { database in
             try Self.readUsageRows(database, path: path, recorder: self.scopedReadWorkRecorderForTesting)
-        }
-    }
-
-    /// Builds compact turn-ID summaries for legacy caches without loading full usage histories.
-    /// A nil result lets the scanner fall back to its correctness-preserving full-history path.
-    func fetchCodexTurnIDs(paths: Set<String>) -> [String: Set<String>]? {
-        guard !paths.isEmpty else { return [:] }
-        guard let data = try? JSONEncoder().encode(paths.sorted()),
-              let pathsJSON = String(data: data, encoding: .utf8)
-        else { return nil }
-        return self.withDatabase(default: nil) { database in
-            let statement = try Self.prepare(database, """
-            WITH target_paths(path) AS (
-                SELECT CAST(value AS TEXT) FROM json_each(?)
-            )
-            SELECT DISTINCT f.path,
-                CASE WHEN json_valid(r.payload) THEN json_extract(r.payload, '$.turnID') END
-            FROM target_paths t
-            JOIN files f ON f.path = t.path
-            LEFT JOIN usage_rows r ON r.file_id = f.id
-            ORDER BY f.path
-            """)
-            defer { sqlite3_finalize(statement) }
-            Self.bind(pathsJSON, to: statement, at: 1)
-
-            var values: [String: Set<String>] = [:]
-            var result = sqlite3_step(statement)
-            while result == SQLITE_ROW {
-                guard let path = Self.columnText(statement, at: 0) else {
-                    throw StoreError.invalidData
-                }
-                values[path, default: []]
-                    .formUnion(Self.columnText(statement, at: 1).map { [$0] } ?? [])
-                result = sqlite3_step(statement)
-            }
-            guard result == SQLITE_DONE else { throw StoreError.sqlite(result) }
-            return values
         }
     }
 
@@ -146,19 +99,10 @@ extension CostUsageStore {
         }
     }
 
-    /// `nil` loads every history row for maintenance/test callers. Concrete sets keep scanner
-    /// reads proportional to the files that can actually be refreshed this pass.
-    func readSnapshot(
-        tokenSnapshotPaths: Set<String>? = nil,
-        usageRowPaths: Set<String>? = nil) -> CostUsageStoreSnapshot
-    {
+    func readSnapshot() -> CostUsageStoreSnapshot {
         self.withDatabase(default: Self.emptySnapshot) { database in
             try Self.inReadTransaction(database) {
-                try Self.readSnapshot(
-                    database,
-                    tokenSnapshotPaths: tokenSnapshotPaths,
-                    usageRowPaths: usageRowPaths,
-                    recorder: self.scopedReadWorkRecorderForTesting)
+                try Self.readSnapshot(database, recorder: self.scopedReadWorkRecorderForTesting)
             }
         }
     }
@@ -225,28 +169,6 @@ extension CostUsageStore {
 // MARK: - Read implementations
 
 extension CostUsageStore {
-    static func readUsageRowCounts(_ database: OpaquePointer) throws -> [String: Int] {
-        let statement = try self.prepare(database, """
-        SELECT f.path, COUNT(r.row_index)
-        FROM files f
-        LEFT JOIN usage_rows r ON r.file_id = f.id
-        GROUP BY f.id, f.path
-        ORDER BY f.path
-        """)
-        defer { sqlite3_finalize(statement) }
-        var values: [String: Int] = [:]
-        var result = sqlite3_step(statement)
-        while result == SQLITE_ROW {
-            guard let path = self.columnText(statement, at: 0),
-                  let count = Int(exactly: sqlite3_column_int64(statement, 1))
-            else { throw StoreError.invalidData }
-            values[path] = count
-            result = sqlite3_step(statement)
-        }
-        guard result == SQLITE_DONE else { throw StoreError.sqlite(result) }
-        return values
-    }
-
     private static var emptySnapshot: CostUsageStoreSnapshot {
         CostUsageStoreSnapshot(
             metadata: .empty,
@@ -264,32 +186,18 @@ extension CostUsageStore {
 
     static func readSnapshot(
         _ database: OpaquePointer,
-        tokenSnapshotPaths: Set<String>?,
-        usageRowPaths: Set<String>?,
+        loadTokenSnapshots: Bool = true,
         recorder: CostUsageStoreReadWorkRecorder?) throws -> CostUsageStoreSnapshot
     {
-        let tokenSnapshots: [CostUsageStoreTokenSnapshot] = if let tokenSnapshotPaths {
-            try tokenSnapshotPaths.sorted().flatMap {
-                try self.readTokenSnapshots(database, path: $0, recorder: recorder)
-            }
-        } else {
-            try self.readTokenSnapshots(database, path: nil, recorder: recorder)
-        }
-        let usageRows: [CostUsageStoreUsageRow] = if let usageRowPaths {
-            try usageRowPaths.sorted().flatMap {
-                try self.readUsageRows(database, path: $0, recorder: recorder)
-            }
-        } else {
-            try self.readUsageRows(database, path: nil, recorder: recorder)
-        }
         let snapshot = try CostUsageStoreSnapshot(
             metadata: self.readSingleton(
                 CostUsageStoreMetadata.self,
                 database: database,
                 table: "scan_metadata") ?? .empty,
             files: self.readFiles(database, recorder: recorder),
-            tokenSnapshots: tokenSnapshots,
-            usageRows: usageRows,
+            tokenSnapshots: loadTokenSnapshots
+                ? self.readTokenSnapshots(database, path: nil, recorder: recorder) : [],
+            usageRows: self.readUsageRows(database, path: nil, recorder: recorder),
             fileDayAggregates: self.readFileDayAggregates(database, path: nil),
             dayAggregates: self.readDayAggregates(database, sinceDay: nil, untilDay: nil),
             forkLineage: self.readForkLineage(database, path: nil),
@@ -303,7 +211,7 @@ extension CostUsageStore {
                 database: database,
                 table: "lookback_state"),
             accumulators: self.readAccumulators(database, path: nil, recorder: recorder))
-        if tokenSnapshotPaths == nil, usageRowPaths == nil {
+        if loadTokenSnapshots {
             recorder?.recordFullSnapshot()
         } else {
             recorder?.recordScannerSnapshot()

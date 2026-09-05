@@ -566,6 +566,7 @@
 "hooks_any_provider" = "أي مزود";
 "hooks_threshold" = "التشغيل عند الاستخدام ≥";
 "hooks_threshold_placeholder" = "90";
+"hooks_executable" = "الملف التنفيذي";
 "hooks_executable_placeholder" = "/usr/local/bin/my-command";
 "hooks_arguments_placeholder" = "الوسائط";
 "hooks_argument_placeholder" = "الوسيطة";
@@ -1489,6 +1490,7 @@
 "Total usage" = "إجمالي الاستخدام";
 "claude_oauth_keychain_access_revoked" = "تم إلغاء وصول CodexBar إلى سلسلة مفاتيح Claude بسبب تدوير الرمز المميز في Claude Code. انقر على «تحديث» لمنح الوصول مجددًا، أو بدّل مصدر استخدام Claude إلى CLI/Web.";
 "claude_showing_last_known_usage" = "يتم عرض آخر بيانات استخدام معروفة، تم التقاطها %@.";
+"claude_limited_usage_detail" = "تفاصيل الاستخدام محدودة";
 /* Spend dashboard cost analysis */
 "90d" = "90d";
 "Input" = "Input";

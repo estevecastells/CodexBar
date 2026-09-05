@@ -196,7 +196,7 @@ complete when the available scan window covers fewer days.
 ## Kilo
 - API token from `~/.codexbar/config.json` (`providers[].apiKey`) or `KILO_API_KEY`.
 - Auto mode tries API first and falls back to CLI auth when API credentials are missing or unauthorized.
-- CLI auth source: `~/.local/share/kilo/auth.json` (`kilo.access`), typically created by `kilo login`.
+- CLI auth source: `~/.local/share/kilo/auth.json` (`kilo.access`), typically created by `kilo auth login`.
 - Status: none yet.
 - Details: `docs/kilo.md`.
 

@@ -82,6 +82,54 @@ struct CostUsageClaudeVertexClassifierTests {
     }
 
     @Test
+    func `raw decoded roots and deeply nested containers match frozen classifier`() throws {
+        var roots: [Any] = try Self.fixtures().map {
+            try JSONSerialization.jsonObject(with: JSONSerialization.data(withJSONObject: $0))
+        }
+        let mixed: NSDictionary = ["vertex": false, 7: "bad"]
+        roots += [
+            mixed,
+            ["metadata": mixed],
+            ["nested": [mixed]],
+            ["message": NSDictionary(dictionary: ["id": "msg_vrtx_x", 7: false])],
+            NSNull(),
+            true,
+            NSNumber(value: 2),
+            "vertex",
+            [],
+            [[:]],
+            ["nothing": NSObject()],
+        ]
+        var deep: [String: Any] = ["provider": "VERTEX"]
+        for _ in 0..<128 {
+            deep = ["nested": deep]
+        }
+        try roots.append(JSONSerialization.jsonObject(with: JSONSerialization.data(withJSONObject: deep)))
+        for json in [
+            #"{"message":{"id":"msg_\u0076rtx_123"}}"#,
+            #"{"requestId":"req_\u0076rtx_123"}"#,
+            #"{"message":{"model":"claude-test\u0040version"}}"#,
+            #"{"metadata":{"pro\u0076ider":"VERTEX\u0130","empty":{}}}"#,
+            #"{"metadata":{"café":{"provider":"vertex"},"cafe\u0301":{"GCP":null}}}"#,
+            #"{"metadata":{"café":{"provider":"anthropic"},"cafe\u0301":{}}}"#,
+            #"{"metadata":{"vertex":false,}}"#,
+        ] {
+            try roots.append(JSONSerialization.jsonObject(with: Data(json.utf8)))
+        }
+        for (index, root) in roots.enumerated() {
+            let expected = (root as? [String: Any]).map {
+                LegacyClaudeVertexClassifier.isVertexAIUsageEntry(obj: $0)
+            } ?? false
+            #expect(CostUsageScanner.isVertexAIUsageEntry(obj: root) == expected, "root \(index)")
+            if JSONSerialization.isValidJSONObject(root),
+               let decoded = try ClaudeJSONObject.decode(JSONSerialization.data(withJSONObject: root))
+            {
+                #expect(CostUsageScanner.isVertexAIUsageEntry(obj: decoded) == expected, "decoded root \(index)")
+            }
+        }
+    }
+
+    @Test
     func `Claude and Vertex ingestion preserve historical rows days tokens and costs`() throws {
         let env = try CostUsageTestEnvironment()
         defer { env.cleanup() }
@@ -112,7 +160,17 @@ struct CostUsageClaudeVertexClassifierTests {
         #expect(!vertex.isEmpty && !claude.isEmpty)
         let malformed = "{invalid json}\n{\"type\":\"assistant\",\"usage\":null}\n"
         let allFile = try env.writeClaudeProjectFile(
-            relativePath: "all/session.jsonl", contents: env.jsonl(entries) + malformed)
+            relativePath: "all/session.jsonl", contents: env.jsonl(entries + entries) + malformed)
+        let subagents = entries.map { entry in
+            var copy = entry
+            copy["isSidechain"] = 2
+            var message = copy["message"] as? [String: Any] ?? [:]
+            message["usage"] = ["input_tokens": 999_999, "output_tokens": 999]
+            copy["message"] = message
+            return copy
+        }
+        _ = try env.writeClaudeProjectFile(
+            relativePath: "all/subagents/duplicates.jsonl", contents: env.jsonl(subagents))
         for (name, filter, expectedEntries, provider) in [
             ("claude", CostUsageScanner.ClaudeLogProviderFilter.excludeVertexAI, claude, UsageProvider.claude),
             ("vertex", .vertexAIOnly, vertex, .vertexai),
@@ -133,10 +191,9 @@ struct CostUsageClaudeVertexClassifierTests {
                 modelsDevCacheRoot: env.cacheRoot)
             #expect(actual.rows == expected.rows)
             #expect(actual.rows.count == expectedEntries.count)
-            #expect(actual.days == expected.days)
-            #expect(actual.days.count == 3)
+            #expect(actual.rows.map { Array($0.model.utf8) } == expected.rows.map { Array($0.model.utf8) })
             #expect(actual.rows.contains { $0.costNanos > 0 })
-            #expect(try actual.parsedBytes == Int64(Data(((env.jsonl(entries)) + malformed).utf8).count))
+            #expect(try actual.parsedBytes == Int64(Data(((env.jsonl(entries + entries)) + malformed).utf8).count))
 
             var options = CostUsageScanner.Options(
                 claudeProjectsRoots: [allFile.deletingLastPathComponent()],
@@ -146,11 +203,19 @@ struct CostUsageClaudeVertexClassifierTests {
             options.refreshMinIntervalSeconds = 0
             let actualReport = CostUsageScanner.loadDailyReport(
                 provider: provider, since: since, until: until, now: until, options: options)
+            let actualCache = CostUsageClaudeCacheIO.load(provider: provider, cacheRoot: options.cacheRoot)
+            #expect(actualCache.days.count == 3)
+            #expect(actualCache.files.values.contains { $0.claudeRows == actual.rows })
+            #expect(actualCache.files.count == 2)
             options.claudeProjectsRoots = [expectedFile.deletingLastPathComponent()]
             options.cacheRoot = env.cacheRoot.appendingPathComponent("expected-\(name)")
             options.claudeLogProviderFilter = .all
             let expectedReport = CostUsageScanner.loadDailyReport(
                 provider: .claude, since: since, until: until, now: until, options: options)
+            let expectedCache = CostUsageClaudeCacheIO.load(provider: .claude, cacheRoot: options.cacheRoot)
+            #expect(actualCache.days == expectedCache.days)
+            #expect(actualCache.files.values.contains { $0.parsedBytes == actual.parsedBytes })
+            #expect(expectedCache.files.values.map(\.parsedBytes) == [expected.parsedBytes])
             #expect(actualReport.data == expectedReport.data)
             #expect(actualReport.summary == expectedReport.summary)
         }

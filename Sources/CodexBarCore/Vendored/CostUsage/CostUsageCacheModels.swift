@@ -14,6 +14,8 @@ struct CostUsageCache: Codable, Equatable, @unchecked Sendable {
     var codexPriorityTurnKeys: [String: String]?
     var codexPriorityTurnIDsByDay: [String: [String]]?
     var codexPriorityTurnsCursor: CostUsageScanner.CodexPriorityTurnsPersistedCursor?
+    /// Last validated report evidence; an empty map is distinct from an older cache without it.
+    var codexResolvedPriorityTurns: [String: CostUsageScanner.CodexPriorityTurnMetadata]?
     var codexScanCatchUpPending: Bool?
     var codexScanProcessedBytes: Int64?
     var codexScanTotalBytes: Int64?
@@ -289,14 +291,8 @@ struct CostUsageFileUsage: Codable, Equatable {
     var codexStandardTokens: [String: [String: Int]]?
     var codexPriorityTokens: [String: [String: Int]]?
     var codexTurnIDs: [String]?
-    // swiftlint:disable implicit_optional_initialization
-    /// Scanner-only marker: persisted turn IDs exist but were intentionally not materialized yet.
-    var codexTurnIDsAreUnloaded: Bool? = nil
     var codexWorkspaceContentFingerprint: String?
     var codexRows: [CostUsageScanner.CodexUsageRow]?
-    /// Scanner-only marker: persisted rows exist but were intentionally not materialized yet.
-    var codexRowsAreUnloaded: Bool? = nil
-    // swiftlint:enable implicit_optional_initialization
     var codexTokenSnapshots: [CostUsageCodexTokenSnapshot]?
     var codexTokenCheckpoints: [CostUsageCodexTokenCheckpoint]?
     var codexTokenTimestampsMonotonic: Bool?

@@ -80,7 +80,14 @@ actor CostUsageStore {
         parserHash: CodexParserHash.value)
     static let cacheGeneration = "sqlite:\(CostUsageStore.schemaVersion)"
     static let compatiblePredecessorParserHashes: Set<String> = [
-        "6366caa15c925349", // Decoded scan baselines before lazy history materialization.
+        "2590d36e1cc4a2ea", // Lazy token history reads preserve persisted rows and scan checkpoints.
+        "edd0a6ad56c0e4e7", // Astra pricing changes report costs without changing native rows or scan checkpoints.
+        "f043ae98075c8e4d", // Retained scan-range scheduling preserves native rows, checkpoints, and reports.
+        "e3fca1e6d81137d6", // Empty-fragment retention preserves native rows, checkpoints, and retained reports.
+        "e0b0319de43e22d7", // LF-span scanning preserves exact bytes, persisted checkpoints, rows, and reports.
+        "7e293e8fc9e25700", // Optional priority validation metadata preserves native usage rows.
+        "494eee446bb2e5f9", // Removing unused Claude parser days leaves native Codex semantics unchanged.
+        "6366caa15c925349", // Claude invocation pricing memos leave native Codex parsing and pricing unchanged.
         "4a593b5d59c7bcf3", // Scan receipt wiring preserves parsing and persisted rows.
         "b77d4ec72e14ea63", // Timestamp and append validation optimization preserves native rows and checkpoints.
         "7b1b44d62a411215", // Test-only trace isolation leaves production parsing and stored history unchanged.
@@ -119,7 +126,6 @@ actor CostUsageStore {
     nonisolated(unsafe) static var codexCatchUpReconciliationVisitForTesting: (() -> Void)?
     /// Test-only read failures scoped by database and path. Never set in production.
     nonisolated(unsafe) static var codexTokenSnapshotReadFailureForTesting: ((URL, String) -> Bool)?
-    nonisolated(unsafe) static var codexUsageRowReadFailureForTesting: ((URL, String) -> Bool)?
 
     /// Process-wide serialization keeps every writable store connection on the same queue.
     /// This matches the scan pipeline's single-writer contract without multiplying executor
@@ -133,6 +139,7 @@ actor CostUsageStore {
     nonisolated let databaseURL: URL
     private let expectedSchemaVersion: Int32
     private let expectedParserHash: String
+    private let busyTimeoutMilliseconds: Int32
     private var connection: SQLiteConnection?
     private var failureGeneration = UUID()
     var retainedCodexBaseline: RetainedCodexBaseline?
@@ -149,7 +156,8 @@ actor CostUsageStore {
     init(
         cacheRoot: URL? = nil,
         schemaVersion: Int32 = CostUsageStore.schemaVersion,
-        parserHash: String = CodexParserHash.value)
+        parserHash: String = CodexParserHash.value,
+        busyTimeoutMilliseconds: Int32 = 5000)
     {
         let root = cacheRoot ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
             .appendingPathComponent("CodexBar", isDirectory: true)
@@ -158,6 +166,7 @@ actor CostUsageStore {
             .appendingPathComponent(Self.databaseFilename, isDirectory: false)
         self.expectedSchemaVersion = schemaVersion
         self.expectedParserHash = parserHash
+        self.busyTimeoutMilliseconds = busyTimeoutMilliseconds
     }
 
     static func combinedSchemaVersion(base: Int, parserHash: String) -> Int32 {
@@ -200,49 +209,42 @@ extension CostUsageStore {
         }
     }
 
-    nonisolated func syncLoadCodexTokenSnapshots(
-        paths: Set<String>) -> [String: [CostUsageStoreTokenSnapshot]]
-    {
-        self.syncLoadCodexTokenSnapshotsIfAvailable(paths: paths) ?? [:]
-    }
-
     nonisolated func syncLoadCodexTokenSnapshotsIfAvailable(
-        paths: Set<String>) -> [String: [CostUsageStoreTokenSnapshot]]?
+        paths: Set<String>,
+        receipt: CodexBaselineReceipt) -> [String: [CostUsageStoreTokenSnapshot]]?
     {
         self.syncWithStoreIsolation { store in
-            var snapshots: [String: [CostUsageStoreTokenSnapshot]] = [:]
-            for path in paths.sorted() {
-                guard let values = store.fetchTokenSnapshotsIfAvailable(path: path) else { return nil }
-                snapshots[path] = values
+            guard let stamp = store.codexBaselineStamp(for: receipt),
+                  store.currentDatabaseStamp() == stamp,
+                  let database = store.connection?.handle
+            else { return nil }
+            do {
+                // Reuse the loaded connection: reopening could rebuild a concurrent replacement.
+                let snapshots = try Self.inReadTransaction(database) {
+                    var snapshots: [String: [CostUsageStoreTokenSnapshot]] = [:]
+                    for path in paths.sorted() {
+                        if Self.codexTokenSnapshotReadFailureForTesting?(store.databaseURL, path) == true {
+                            throw StoreError.sqlite(SQLITE_IOERR)
+                        }
+                        snapshots[path] = try Self.readTokenSnapshots(
+                            database, path: path, recorder: store.scopedReadWorkRecorderForTesting)
+                        #if DEBUG
+                        if let checkpoint = Self.codexTokenHydrationCheckpointForTesting,
+                           checkpoint.databaseURL == store.databaseURL
+                        {
+                            try checkpoint.checkpoint()
+                        }
+                        #endif
+                    }
+                    return snapshots
+                }
+                // A read transaction pins data_version; validate again only after COMMIT.
+                guard store.currentDatabaseStamp() == stamp else { return nil }
+                return snapshots
+            } catch {
+                store.recoverConnectionAfterFailure()
+                return nil
             }
-            return snapshots
-        }
-    }
-
-    nonisolated func syncLoadCodexUsageRows(
-        paths: Set<String>) -> [String: [CostUsageStoreUsageRow]]
-    {
-        self.syncLoadCodexUsageRowsIfAvailable(paths: paths) ?? [:]
-    }
-
-    nonisolated func syncLoadCodexUsageRowsIfAvailable(
-        paths: Set<String>) -> [String: [CostUsageStoreUsageRow]]?
-    {
-        self.syncWithStoreIsolation { store in
-            var rows: [String: [CostUsageStoreUsageRow]] = [:]
-            for path in paths.sorted() {
-                guard let values = store.fetchUsageRowsIfAvailable(path: path) else { return nil }
-                rows[path] = values
-            }
-            store.scopedReadWorkRecorderForTesting?.recordUsageRowDecodes(
-                count: rows.values.reduce(0) { $0 + $1.count })
-            return rows
-        }
-    }
-
-    nonisolated func syncLoadCodexTurnIDs(paths: Set<String>) -> [String: Set<String>]? {
-        self.syncWithStoreIsolation { store in
-            store.fetchCodexTurnIDs(paths: paths)
         }
     }
 
@@ -263,7 +265,6 @@ extension CostUsageStore {
         rowBudget: Int = CostUsageStore.defaultRowBudget,
         fileBudgetBytes: Int64 = CostUsageStore.defaultFileBudgetBytes,
         unloadedTokenSnapshotPaths: Set<String> = [],
-        unloadedUsageRowPaths: Set<String> = [],
         skipIdenticalContent: Bool = false,
         receipt: CodexBaselineReceipt? = nil) -> CostUsageStoreBudgetResult
     {
@@ -276,7 +277,6 @@ extension CostUsageStore {
                 rowBudget: rowBudget,
                 fileBudgetBytes: fileBudgetBytes,
                 unloadedTokenSnapshotPaths: unloadedTokenSnapshotPaths,
-                unloadedUsageRowPaths: unloadedUsageRowPaths,
                 skipIdenticalContent: skipIdenticalContent,
                 receipt: receipt)
         }
@@ -539,7 +539,7 @@ extension CostUsageStore {
             throw StoreError.sqlite(result)
         }
         do {
-            try Self.configure(opened)
+            try Self.configure(opened, busyTimeoutMilliseconds: self.busyTimeoutMilliseconds)
             if existed {
                 try self.validateExistingDatabase(opened)
             } else {
@@ -863,8 +863,8 @@ extension CostUsageStore {
 // MARK: - SQLite primitives
 
 extension CostUsageStore {
-    static func configure(_ database: OpaquePointer) throws {
-        guard sqlite3_busy_timeout(database, 5000) == SQLITE_OK else {
+    static func configure(_ database: OpaquePointer, busyTimeoutMilliseconds: Int32) throws {
+        guard sqlite3_busy_timeout(database, busyTimeoutMilliseconds) == SQLITE_OK else {
             throw self.sqliteError(database)
         }
         try self.execute(database, "PRAGMA foreign_keys=ON")

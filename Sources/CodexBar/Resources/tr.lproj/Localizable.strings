@@ -565,6 +565,7 @@
 "hooks_any_provider" = "Herhangi bir sağlayıcı";
 "hooks_threshold" = "Şu kullanım düzeyinde tetikle: ≥";
 "hooks_threshold_placeholder" = "90";
+"hooks_executable" = "Çalıştırılabilir dosya";
 "hooks_executable_placeholder" = "/usr/local/bin/my-command";
 "hooks_arguments_placeholder" = "Argümanlar";
 "hooks_argument_placeholder" = "Argüman";
@@ -1487,6 +1488,7 @@
 "Total usage" = "Toplam kullanım";
 "claude_oauth_keychain_access_revoked" = "Claude Anahtar Zinciri erişimi, Claude Code'un token yenilemesi nedeniyle iptal edildi. Erişimi yeniden vermek için Yenile'ye tıklayın veya Claude kullanım kaynağını CLI/Web olarak değiştirin.";
 "claude_showing_last_known_usage" = "Bilinen son kullanım gösteriliyor (yakalanma zamanı: %@).";
+"claude_limited_usage_detail" = "Kullanım ayrıntıları sınırlı";
 /* Spend dashboard cost analysis */
 "90d" = "90d";
 "Input" = "Girdi";

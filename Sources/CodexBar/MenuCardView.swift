@@ -587,6 +587,8 @@ private struct MetricRow: View {
             .lineLimit(lineLimit)
             .fixedSize(horizontal: false, vertical: true)
             .hidden()
+            // Freeze the measured height, but let updates use the entire metric row width.
+            .frame(maxWidth: .infinity, alignment: .leading)
             .overlay(alignment: .topLeading) {
                 if let text, !text.isEmpty {
                     Text(text)
@@ -594,7 +596,6 @@ private struct MetricRow: View {
                         .foregroundStyle(MenuHighlightStyle.secondary(self.isHighlighted))
                         .lineLimit(lineLimit)
                         .truncationMode(.tail)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .clipped()
@@ -965,14 +966,21 @@ extension UsageMenuCardView.Model {
         let creditsScaleText = Self.creditsScaleText(credits: input.credits)
         let codexCreditLimitDetail = Self.codexCreditLimitDetail(credits: input.credits, now: input.now)
         let isClaudeAdminAPI = input.snapshot?.loginMethod(for: input.provider) == "Admin API"
+        let extraUsageCost = Self.resolvedProviderCost(input: input)
+        let extraUsageSnapshot = extraUsageCost.map { cost in
+            (input.snapshot ?? UsageSnapshot(
+                primary: nil,
+                secondary: nil,
+                updatedAt: cost.updatedAt)).with(providerCost: cost)
+        } ?? input.snapshot
         let showsProviderCost = menuCard.showsProviderCost(context: ProviderCostVisibilityContext(
-            snapshot: input.snapshot,
+            snapshot: extraUsageSnapshot,
             showOptionalUsage: input.showOptionalCreditsAndExtraUsage))
-        let providerCostStyle = input.snapshot.map {
+        let providerCostStyle = extraUsageSnapshot.map {
             presentation.cost(snapshot: $0).menuCardStyle
         } ?? .generic
         let providerCostFollowsSummaryStyle = Self.providerCostFollowsSummaryStyle(
-            cost: input.snapshot?.providerCost,
+            cost: extraUsageCost,
             style: providerCostStyle,
             isClaudeAdminAPI: isClaudeAdminAPI) && !menuCard.providerCostIsRequiredUsage
         let providerCost: ProviderCostSection? = if !showsProviderCost ||
@@ -981,7 +989,7 @@ extension UsageMenuCardView.Model {
             nil
         } else {
             Self.providerCostSection(
-                cost: input.snapshot?.providerCost,
+                cost: extraUsageCost,
                 style: providerCostStyle,
                 percentStyle: input.usageBarsShowUsed ? .used : .left,
                 isClaudeAdminAPI: isClaudeAdminAPI,
@@ -1031,6 +1039,19 @@ extension UsageMenuCardView.Model {
             tokenUsage: tokenUsage,
             placeholder: placeholder,
             progressColor: Self.progressColor(for: input.provider))
+    }
+
+    private static func resolvedProviderCost(input: Input) -> ProviderCostSnapshot? {
+        // Provider-specific by design: Codex extra credits come from member credit snapshots, not USD spend.
+        if input.provider == .codex {
+            if let projected = input.codexProjection?.extraUsageCost {
+                return projected
+            }
+            if let fromCredits = CodexExtraUsageCost.providerCost(from: input.credits) {
+                return fromCredits
+            }
+        }
+        return input.snapshot?.providerCost
     }
 
     private static func visibleProviderDetails(input: Input) -> [ProviderDetailSection] {

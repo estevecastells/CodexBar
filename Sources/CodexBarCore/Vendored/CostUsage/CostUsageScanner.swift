@@ -309,6 +309,7 @@ enum CostUsageScanner {
     struct CodexParseResult {
         let days: [String: [String: [Int]]]
         var parsedBytes: Int64
+        let scanTargetSize: Int64
         let lastModel: String?
         let lastTotals: CostUsageCodexTotals?
         let lastCountedTotals: CostUsageCodexTotals?
@@ -383,7 +384,6 @@ enum CostUsageScanner {
 
     struct CodexScanState {
         var contributingSessionIds: Set<String> = []
-        var contributingFilePathsBySessionID: [String: Set<String>] = [:]
         var seenFileIds: Set<String> = []
         var seenCodexUsageRowKeys: Set<String> = []
         var deferredCachePaths: Set<String> = []
@@ -937,7 +937,6 @@ enum CostUsageScanner {
         let forceFullScan: Bool
         let dropDeferredCodexRows: Bool
         let requiresTurnIDCache: Bool
-        let pricingMetadataMigrationPathKeys: Set<String>
         let changedPriorityTurnIDs: Set<String>
         let resources: CodexScanResources
         let checkCancellation: CancellationCheck?
@@ -1041,7 +1040,6 @@ enum CostUsageScanner {
         let rootsChanged: Bool
         let windowExpanded: Bool
         let needsPricingMetadataMigration: Bool
-        let pricingMetadataMigrationPathKeys: Set<String>
         let needsProjectMetadataMigration: Bool
         let modelsDevCatalog: ModelsDevCatalog?
         let codexPricingKey: String
@@ -1051,6 +1049,7 @@ enum CostUsageScanner {
         let priorityTurnKeys: [String: String]
         let priorityTurnIDsByDay: [String: [String]]
         let inspectedPriorityTurns: Bool
+        let priorityValidationPending: Bool
         let priorityTurnsCursor: CodexPriorityTurnsPersistedCursor?
         let priorityMetadataChanged: Bool
         let priorityTurnsChanged: Bool
@@ -1819,6 +1818,9 @@ enum CostUsageScanner {
                 fileURL: fileURL,
                 metadata: parentMetadata)
             {
+                if self.scanBudget != nil, !cachedResolution.isComplete {
+                    self.pendingParentFiles[fileURL.standardizedFileURL.path] = fileURL
+                }
                 self.snapshotResolutions[sessionId] = cachedResolution
                 return cachedResolution
             }
@@ -1928,7 +1930,6 @@ enum CostUsageScanner {
     }
 
     struct ClaudeParseResult {
-        let days: [String: [String: [Int]]]
         let rows: [ClaudeUsageRow]
         let parsedBytes: Int64
     }
@@ -2021,7 +2022,7 @@ enum CostUsageScanner {
     struct CostUsageDayRange {
         let sinceKey: String
         let untilKey: String
-        let scanSinceKey: String
+        private(set) var scanSinceKey: String
         let scanUntilKey: String
         let calendar: Calendar
 
@@ -2038,6 +2039,12 @@ enum CostUsageScanner {
 
         static func localGregorianCalendar(matching calendar: Calendar = .current) -> Calendar {
             CostUsageLocalDay.gregorianCalendar(matching: calendar)
+        }
+
+        func retainingScanStart(_ scanSinceKey: String) -> Self {
+            var retained = self
+            retained.scanSinceKey = min(self.scanSinceKey, scanSinceKey)
+            return retained
         }
 
         static func dayKey(from date: Date, calendar: Calendar = .current) -> String {
@@ -2288,6 +2295,39 @@ enum CostUsageScanner {
             CostUsageDayRange.isInRange(dayKey: key, since: retainedSinceKey, until: retainedUntilKey)
         }
         return out.isEmpty ? nil : out
+    }
+
+    private static func validatedPriorityTurns(
+        cache: CostUsageCache,
+        calendar: Calendar) -> [String: CodexPriorityTurnMetadata]
+    {
+        if let resolved = cache.codexResolvedPriorityTurns {
+            return resolved
+        }
+        // Older caches only have a resume cursor. A historical scan may have superseded its
+        // pricing, so adopt only days whose published classification still matches the cursor.
+        let turns = cache.codexPriorityTurnsCursor?.turns ?? [:]
+        let keys = Self.codexPriorityTurnKeys(turns, calendar: calendar)
+        return turns.filter { _, turn in
+            guard let day = Self.codexPriorityDayKey(turn, calendar: calendar) else { return false }
+            return keys[day] == cache.codexPriorityTurnKeys?[day]
+        }
+    }
+
+    private static func mergeResolvedPriorityTurns(
+        existing: [String: CodexPriorityTurnMetadata],
+        new: [String: CodexPriorityTurnMetadata],
+        range: CostUsageDayRange,
+        retainedSinceKey: String,
+        retainedUntilKey: String) -> [String: CodexPriorityTurnMetadata]
+    {
+        var out = existing.filter { _, turn in
+            guard let day = Self.codexPriorityDayKey(turn, calendar: range.calendar) else { return false }
+            return CostUsageDayRange.isInRange(dayKey: day, since: retainedSinceKey, until: retainedUntilKey)
+                && !CostUsageDayRange.isInRange(dayKey: day, since: range.scanSinceKey, until: range.scanUntilKey)
+        }
+        out.merge(new) { _, replacement in replacement }
+        return out
     }
 
     private static func mergePriorityTurnIDsByDay(
@@ -3191,11 +3231,7 @@ enum CostUsageScanner {
                 return resolvedPath
             }
             guard let usage = cache.files[fileURL.path],
-                  usage.codexScanComplete == true,
-                  !usage.hasBufferedCodexForkRetryLines,
-                  usage.codexScanFileId == metadata.fileId,
-                  usage.mtimeUnixMs == metadata.mtimeUnixMs,
-                  usage.size == metadata.size
+                  Self.completedCodexLogicalTargetSize(metadata: metadata, usage: usage) != nil
             else { return nil }
             return resolvedPath
         })
@@ -4120,6 +4156,7 @@ enum CostUsageScanner {
                 checkCancellation: nil)) ?? CodexParseResult(
             days: [:],
             parsedBytes: startOffset,
+            scanTargetSize: startOffset,
             lastModel: initialModel,
             lastTotals: initialTotals,
             lastCountedTotals: initialTotals,
@@ -4164,6 +4201,7 @@ enum CostUsageScanner {
         initialBufferedSubagentLines: [CodexBufferedFastLine]? = nil,
         initialBufferedUnresolvedForkLines: [CodexBufferedFastLine]? = nil,
         initialJSONLResumeState: CostUsageJsonl.ResumeState? = nil,
+        scanTargetSize: Int64? = nil,
         maxBytesToRead: Int64? = nil,
         shouldStopReading: ((Int64) -> Bool)? = nil,
         inheritedTotalsResolver: ((String, String) throws -> CodexForkBaseline)? = nil,
@@ -4672,7 +4710,11 @@ enum CostUsageScanner {
         }
 
         var parsedBytes: Int64
-        let targetSize = Self.codexFileMetadata(fileURL: fileURL).size
+        let currentFileSize = Self.codexFileMetadata(fileURL: fileURL).size
+        let requestedTargetSize = max(startOffset, min(scanTargetSize ?? currentFileSize, currentFileSize))
+        var effectiveTargetSize = requestedTargetSize
+        let bytesToTarget = max(0, requestedTargetSize - startOffset)
+        let boundedBytesToRead = maxBytesToRead.map { min(max(0, $0), bytesToTarget) } ?? bytesToTarget
         var physicalLineIndex = (initialBufferedSubagentLines?.last?.lineIndex ?? -1) + 1
         var jsonlResumeState = initialJSONLResumeState
         do {
@@ -4681,7 +4723,7 @@ enum CostUsageScanner {
                 offset: startOffset,
                 maxLineBytes: maxLineBytes,
                 prefixBytes: prefixBytes,
-                maxBytesToRead: maxBytesToRead,
+                maxBytesToRead: boundedBytesToRead,
                 resumeState: initialJSONLResumeState,
                 shouldStop: shouldStopReading,
                 checkCancellation: checkCancellation,
@@ -4923,7 +4965,24 @@ enum CostUsageScanner {
                 throw deferredError
             }
 
-            if let pendingSubagentLines, parsedBytes >= targetSize, jsonlResumeState == nil {
+            // A rollout can be observed while Codex is between writes. If the captured target ends
+            // inside a JSON record, publish the finite prefix through the last committed boundary and
+            // let the next scan reread the unfinished record with the later tail. Keeping the partial
+            // resume state here would require bytes beyond the frozen target and could chase EOF again.
+            if parsedBytes >= requestedTargetSize, jsonlResumeState != nil {
+                parsedBytes = scanProgress.committedOffset
+                jsonlResumeState = nil
+                effectiveTargetSize = parsedBytes
+            }
+
+            // Unlike an ordinary rollout, a subagent prefix is not independently publishable:
+            // later lineage metadata can reclassify already-buffered totals as copied history.
+            let hasUnconsumedPhysicalTail = effectiveTargetSize < currentFileSize
+            if let pendingSubagentLines,
+               parsedBytes >= effectiveTargetSize,
+               jsonlResumeState == nil,
+               !hasUnconsumedPhysicalTail
+            {
                 // Same-leaf metadata can fill lineage fields after the opening record. Collect it
                 // before replay so copied-prefix totals never run once on the wrong baseline, and
                 // so an owned-suffix filter cannot discard the only fork identifier.
@@ -5092,6 +5151,7 @@ enum CostUsageScanner {
         return CodexParseResult(
             days: days,
             parsedBytes: parsedBytes,
+            scanTargetSize: effectiveTargetSize,
             lastModel: currentModel,
             lastTotals: sawDivergentTotals && !Self.codexTotalsEqual(rawTotalsBaseline, previousTotals)
                 ? nil
@@ -5113,7 +5173,8 @@ enum CostUsageScanner {
             rows: rows,
             tokenSnapshots: tokenSnapshots,
             jsonlResumeState: jsonlResumeState,
-            bufferedSubagentLines: parsedBytes < targetSize
+            bufferedSubagentLines: parsedBytes < effectiveTargetSize
+                || effectiveTargetSize < currentFileSize
                 || jsonlResumeState != nil
                 || hasUnresolvedForkBaseline
                 ? pendingSubagentLines
@@ -5154,30 +5215,6 @@ enum CostUsageScanner {
         return context.resources.scanHistoryHydrator.isHydrated(for: [fileURL], cache: cache)
     }
 
-    static func prepareCodexRowDeduplication(
-        sessionId: String,
-        context: CodexFileScanContext,
-        cache: inout CostUsageCache,
-        state: inout CodexScanState) -> Bool
-    {
-        let contributingPaths = state.contributingFilePathsBySessionID[sessionId] ?? []
-        guard !contributingPaths.isEmpty else { return true }
-        let files = contributingPaths.map { URL(fileURLWithPath: $0) }
-        _ = context.resources.scanHistoryHydrator.hydrateUsage(for: files, cache: &cache)
-        guard context.resources.scanHistoryHydrator.isUsageHydrated(for: files, cache: cache) else {
-            return false
-        }
-        for path in contributingPaths {
-            guard let rows = cache.files[path]?.codexRows else { continue }
-            Self.rememberCodexRows(
-                rows,
-                sessionId: sessionId,
-                fileIdentity: path,
-                state: &state)
-        }
-        return true
-    }
-
     private static func scanCodexFile(
         fileURL: URL,
         context: CodexFileScanContext,
@@ -5191,6 +5228,7 @@ enum CostUsageScanner {
             context.resources.cachePathAliasIndex.update(
                 path: metadata.path,
                 fileID: cache.files[metadata.path]?.codexScanFileId)
+            context.resources.scanHistoryHydrator.update(path: metadata.path, usage: cache.files[metadata.path])
         }
         if let fileId = metadata.fileId, state.seenFileIds.contains(fileId) {
             Self.dropCachedCodexFile(path: metadata.path, cached: cache.files[metadata.path], cache: &cache)
@@ -5200,43 +5238,25 @@ enum CostUsageScanner {
             metadata: metadata,
             cache: &cache,
             aliasIndex: context.resources.cachePathAliasIndex,
-            history: context.resources.scanHistoryHydrator)
+            history: context.resources.scanHistoryHydrator,
+            inheritedResolver: context.resources.inheritedResolver)
         {
             state.deferredCachePaths.insert(deferredAliasPath)
             return .deferred
         }
 
-        let shouldLoadHistoryBeforeFreshness = loadHistoryBeforeFreshness
-            || context.pricingMetadataMigrationPathKeys.contains(Self.codexPathKey(fileURL))
-        if shouldLoadHistoryBeforeFreshness,
+        if loadHistoryBeforeFreshness,
            !Self.hydrateCodexScanHistory(for: fileURL, context: context, cache: &cache)
         {
             state.deferredCachePaths.insert(metadata.path)
             return .deferred
         }
         var cached = cache.files[metadata.path]
-        if let sessionID = cached?.sessionId,
-           state.contributingSessionIds.contains(sessionID)
-        {
-            _ = context.resources.scanHistoryHydrator.hydrateUsage(for: [fileURL], cache: &cache)
-            guard context.resources.scanHistoryHydrator.isUsageHydrated(for: [fileURL], cache: cache),
-                  Self.prepareCodexRowDeduplication(
-                      sessionId: sessionID,
-                      context: context,
-                      cache: &cache,
-                      state: &state)
-            else {
-                state.deferredCachePaths.insert(metadata.path)
-                return .deferred
-            }
-            cached = cache.files[metadata.path]
-        }
-
         var input = CodexFileScanInput(fileURL: fileURL, metadata: metadata, cached: cached)
         if try Self.keepCachedCodexFileIfFresh(input: input, context: context, cache: &cache, state: &state) {
             return .processed
         }
-        if !shouldLoadHistoryBeforeFreshness {
+        if !loadHistoryBeforeFreshness {
             guard Self.hydrateCodexScanHistory(for: fileURL, context: context, cache: &cache) else {
                 state.deferredCachePaths.insert(metadata.path)
                 return .deferred
@@ -5303,17 +5323,12 @@ enum CostUsageScanner {
             fullRescanAllowedBytes = fullRescanWorkBytes
         }
 
-        guard try Self.rescanCodexFile(
+        try Self.rescanCodexFile(
             input: input,
             context: context,
             cache: &cache,
             state: &state,
             maxBytesToRead: fullRescanAllowedBytes)
-        else {
-            context.scanBudget?.release(workBytes: fullRescanAllowedBytes)
-            state.deferredCachePaths.insert(metadata.path)
-            return .deferred
-        }
         context.scanBudget?.consume(workBytes: fullRescanAllowedBytes)
         return .processed
     }
@@ -5331,24 +5346,25 @@ enum CostUsageScanner {
             return max(0, metadata.size - startOffset)
         }
         if cached.codexScanComplete == false {
-            if cached.codexScanFileId != nil,
-               cached.codexScanFileId == metadata.fileId,
-               let parsedBytes = cached.parsedBytes,
-               parsedBytes > 0,
-               parsedBytes <= metadata.size,
-               cached.codexTokenIndexAnchor?.indexedBytes == parsedBytes,
-               cached.codexTokenIndexAnchor.map({
-                   Self.codexTokenIndexAnchorMatches(
-                       $0,
-                       fileURL: URL(fileURLWithPath: metadata.path),
-                       metadata: metadata)
-               }) == true
+            if let targetSize = Self.codexResumableScanTargetSize(metadata: metadata, cached: cached),
+               let parsedBytes = cached.parsedBytes
             {
-                return max(0, metadata.size - parsedBytes)
+                return max(0, targetSize - parsedBytes)
+            }
+            if Self.isValidatedCodexFrozenTargetTail(metadata: metadata, cached: cached),
+               cached.forkedFromId == nil || cached.codexBufferedSubagentLines?.isEmpty == false
+            {
+                let startOffset = cached.parsedBytes ?? cached.size
+                return max(0, metadata.size - startOffset)
             }
             return max(0, metadata.size)
         }
         let startOffset = cached.parsedBytes ?? cached.size
+        if Self.isValidatedCodexFrozenTargetTail(metadata: metadata, cached: cached),
+           cached.forkedFromId == nil || cached.codexBufferedSubagentLines?.isEmpty == false
+        {
+            return max(0, metadata.size - startOffset)
+        }
         if metadata.size > cached.size,
            startOffset > 0,
            startOffset <= metadata.size,
@@ -5384,7 +5400,7 @@ enum CostUsageScanner {
         let pricingKeyChanged = cache.codexPricingKey != codexPricingKey
         let codexPriorityMetadataKey = Self.codexPriorityMetadataKey(databaseURL: options.codexTraceDatabaseURL)
         let hasPriorityMetadata = codexPriorityMetadataKey.hasPrefix("sqlite:")
-        let priorityMetadataChanged = Self.codexPriorityMetadataChanged(
+        let detectedPriorityMetadataChanged = Self.codexPriorityMetadataChanged(
             old: cache.codexPriorityMetadataKey,
             new: codexPriorityMetadataKey)
         let turnIDCacheMigrationPathKeys = hasPriorityMetadata ? Set(cache.files.compactMap { path, usage in
@@ -5402,7 +5418,7 @@ enum CostUsageScanner {
             || needsPricingMetadataMigration
             || needsProjectMetadataMigration
             || needsTurnIDCacheMigration
-            || priorityMetadataChanged
+            || detectedPriorityMetadataChanged
             || refreshMs == 0
             || cache.lastScanUnixMs == 0
             || nowMs - cache.lastScanUnixMs > refreshMs
@@ -5416,22 +5432,30 @@ enum CostUsageScanner {
                     databaseURL: resolvedPriorityDatabaseURL)
             }
         }
-        let priorityTurns = shouldInspectPriorityTurns ? Self.codexPriorityTurns(
+        let previouslyObservedDatabase = cache.codexPriorityMetadataKey
+            == "sqlite:\(resolvedPriorityDatabaseURL.standardizedFileURL.path)"
+        let priorityResolution = shouldInspectPriorityTurns ? Self.resolveCodexPriorityTurns(
             databaseURL: resolvedPriorityDatabaseURL,
             sinceDayKey: range.scanSinceKey,
-            untilDayKey: range.scanUntilKey) : [:]
-        let priorityTurnsCursor = shouldInspectPriorityTurns
+            untilDayKey: range.scanUntilKey,
+            expectExistingDatabase: previouslyObservedDatabase) : nil
+        let priorityTurns = priorityResolution?.turns
+            ?? Self.validatedPriorityTurns(cache: cache, calendar: range.calendar)
+        let priorityValidationPending = priorityResolution?.validationPending ?? false
+        let priorityMetadataChanged = detectedPriorityMetadataChanged && !priorityValidationPending
+        let priorityTurnsCursor = shouldInspectPriorityTurns && !priorityValidationPending
             ? Self.codexPriorityTurnsPersistedCursor(databaseURL: resolvedPriorityDatabaseURL)
             : nil
         let priorityTurnKeys = Self.codexPriorityTurnKeys(priorityTurns, calendar: range.calendar)
         let priorityTurnIDsByDay = Self.codexPriorityTurnIDsByDay(priorityTurns, calendar: range.calendar)
         let priorityTurnsChanged = shouldInspectPriorityTurns
+            && !priorityValidationPending
             && hasPriorityMetadata
             && Self.codexPriorityTurnKeysChanged(
                 old: cache.codexPriorityTurnKeys,
                 new: priorityTurnKeys,
                 range: range)
-        let changedPriorityTurnIDs = shouldInspectPriorityTurns && hasPriorityMetadata
+        let changedPriorityTurnIDs = shouldInspectPriorityTurns && !priorityValidationPending && hasPriorityMetadata
             ? Self.changedPriorityTurnIDs(
                 old: cache.codexPriorityTurnIDsByDay,
                 new: priorityTurnIDsByDay,
@@ -5457,6 +5481,7 @@ enum CostUsageScanner {
             || needsTurnIDCacheMigration
             || priorityMetadataChanged
             || priorityTurnsChanged
+            || priorityValidationPending
             || refreshMs == 0
             || cache.lastScanUnixMs == 0
             || nowMs - cache.lastScanUnixMs > refreshMs
@@ -5468,7 +5493,6 @@ enum CostUsageScanner {
             rootsChanged: rootsChanged,
             windowExpanded: windowExpanded,
             needsPricingMetadataMigration: needsPricingMetadataMigration,
-            pricingMetadataMigrationPathKeys: pricingMetadataMigrationPathKeys,
             needsProjectMetadataMigration: needsProjectMetadataMigration,
             modelsDevCatalog: modelsDevCatalog,
             codexPricingKey: codexPricingKey,
@@ -5478,6 +5502,7 @@ enum CostUsageScanner {
             priorityTurnKeys: priorityTurnKeys,
             priorityTurnIDsByDay: priorityTurnIDsByDay,
             inspectedPriorityTurns: shouldInspectPriorityTurns,
+            priorityValidationPending: priorityValidationPending,
             priorityTurnsCursor: priorityTurnsCursor,
             priorityMetadataChanged: priorityMetadataChanged,
             priorityTurnsChanged: priorityTurnsChanged,
@@ -5493,145 +5518,105 @@ enum CostUsageScanner {
         options: Options,
         range: CostUsageDayRange) -> CostUsageStoreLoad
     {
-        CostUsageStoreAccess.loadForScan(cacheRoot: options.cacheRoot, calendar: range.calendar)
+        CostUsageStoreAccess.load(cacheRoot: options.cacheRoot, calendar: range.calendar)
     }
 
     final class CodexScanHistoryHydrator {
         private let store: CostUsageStore
-        var unloadedTokenPaths: Set<String>
-        var unloadedUsagePaths: Set<String>
-        private var legacyTurnIDSummaryPaths: Set<String>
+        private let receipt: CostUsageStore.CodexBaselineReceipt
+        private(set) var unloadedTokenPaths: Set<String>
+        private var pathsByKey: [String: Set<String>] = [:]
+        private var pathsBySessionID: [String: Set<String>] = [:]
+        private var keyByPath: [String: String] = [:]
+        private var sessionIDByPath: [String: String] = [:]
 
         init(load: CostUsageStoreLoad) {
             self.store = load.store
+            self.receipt = load.receipt
             self.unloadedTokenPaths = load.unloadedTokenSnapshotPaths
-            self.unloadedUsagePaths = load.unloadedUsageRowPaths
-            self.legacyTurnIDSummaryPaths = load.legacyTurnIDSummaryPaths
+            for (path, usage) in load.cache.files {
+                self.update(path: path, usage: usage)
+            }
         }
 
         func reset() {
             self.unloadedTokenPaths.removeAll()
-            self.unloadedUsagePaths.removeAll()
+            self.pathsByKey.removeAll()
+            self.pathsBySessionID.removeAll()
+            self.keyByPath.removeAll()
+            self.sessionIDByPath.removeAll()
         }
 
-        func moveHistory(from oldPath: String, to newPath: String) {
-            if self.unloadedTokenPaths.remove(oldPath) != nil {
-                self.unloadedTokenPaths.insert(newPath)
+        func update(path: String, usage: CostUsageFileUsage?) {
+            self.removeIndex(path: path)
+            guard let usage else {
+                self.unloadedTokenPaths.remove(path)
+                return
             }
-            if self.unloadedUsagePaths.remove(oldPath) != nil {
-                self.unloadedUsagePaths.insert(newPath)
+            let key = CostUsageScanner.codexPathKey(URL(fileURLWithPath: path))
+            self.keyByPath[path] = key
+            self.pathsByKey[key, default: []].insert(path)
+            if let sessionID = usage.sessionId, !sessionID.isEmpty {
+                self.sessionIDByPath[path] = sessionID
+                self.pathsBySessionID[sessionID, default: []].insert(path)
             }
         }
 
         func removeHistory(path: String) {
             self.unloadedTokenPaths.remove(path)
-            self.unloadedUsagePaths.remove(path)
+            self.removeIndex(path: path)
         }
 
-        func hydrateLegacyTurnIDSummaries(for files: [URL], cache: inout CostUsageCache) {
-            let paths = self.selectedPaths(for: files, cache: cache)
-                .intersection(self.legacyTurnIDSummaryPaths)
-            guard !paths.isEmpty,
-                  let turnIDsByPath = self.store.syncLoadCodexTurnIDs(paths: paths)
-            else { return }
-            for path in paths {
-                guard let turnIDs = turnIDsByPath[path], var usage = cache.files[path] else { continue }
-                usage.codexTurnIDs = turnIDs.sorted()
-                usage.codexTurnIDsAreUnloaded = nil
-                cache.files[path] = usage
-                self.legacyTurnIDSummaryPaths.remove(path)
+        private func removeIndex(path: String) {
+            if let key = self.keyByPath.removeValue(forKey: path) {
+                self.pathsByKey[key]?.remove(path)
+                if self.pathsByKey[key]?.isEmpty == true {
+                    self.pathsByKey.removeValue(forKey: key)
+                }
+            }
+            if let sessionID = self.sessionIDByPath.removeValue(forKey: path) {
+                self.pathsBySessionID[sessionID]?.remove(path)
+                if self.pathsBySessionID[sessionID]?.isEmpty == true {
+                    self.pathsBySessionID.removeValue(forKey: sessionID)
+                }
             }
         }
 
-        @discardableResult
-        func hydrateUsage(for files: [URL], cache: inout CostUsageCache) -> Set<String> {
-            self.hydrateUsage(
-                paths: self.selectedPaths(for: files, cache: cache),
-                cache: &cache)
-        }
-
-        func isUsageHydrated(for files: [URL], cache: CostUsageCache) -> Bool {
-            self.selectedPaths(for: files, cache: cache).isDisjoint(with: self.unloadedUsagePaths)
-        }
-
         func isHydrated(for files: [URL], cache: CostUsageCache) -> Bool {
-            let selectedPaths = self.selectedPaths(for: files, cache: cache)
-            guard selectedPaths.isDisjoint(with: self.unloadedUsagePaths) else { return false }
-            return self.tokenHistoryPaths(for: selectedPaths, cache: cache)
-                .isDisjoint(with: self.unloadedTokenPaths)
+            self.tokenHistoryPaths(for: files, cache: cache).isDisjoint(with: self.unloadedTokenPaths)
         }
 
         @discardableResult
         func hydrate(for files: [URL], cache: inout CostUsageCache) -> Set<String> {
-            let selectedPaths = self.selectedPaths(for: files, cache: cache)
-            _ = self.hydrateUsage(paths: selectedPaths, cache: &cache)
-
             guard !self.unloadedTokenPaths.isEmpty else { return [] }
-            let pathsToLoad = self.tokenHistoryPaths(for: selectedPaths, cache: cache)
-                .intersection(self.unloadedTokenPaths)
-            guard !pathsToLoad.isEmpty else { return [] }
-            guard let snapshotsByPath = self.store.syncLoadCodexTokenSnapshotsIfAvailable(paths: pathsToLoad)
+            let paths = self.tokenHistoryPaths(for: files, cache: cache).intersection(self.unloadedTokenPaths)
+            guard !paths.isEmpty,
+                  let snapshotsByPath = self.store.syncLoadCodexTokenSnapshotsIfAvailable(
+                      paths: paths,
+                      receipt: self.receipt)
             else { return [] }
-            for path in pathsToLoad {
-                guard var usage = cache.files[path] else { continue }
-                let snapshots = (snapshotsByPath[path] ?? []).map(CostUsageStore.tokenSnapshot(from:))
+            for path in paths {
+                guard var usage = cache.files[path], let persisted = snapshotsByPath[path] else { continue }
+                let snapshots = persisted.map(CostUsageStore.tokenSnapshot(from:))
                 usage.codexTokenSnapshots = snapshots
                 usage.codexTokenCheckpoints = CostUsageScanner.codexTokenCheckpoints(for: snapshots)
                 cache.files[path] = usage
                 self.unloadedTokenPaths.remove(path)
             }
-            return pathsToLoad
+            return paths
         }
 
-        private func tokenHistoryPaths(
-            for selectedPaths: Set<String>,
-            cache: CostUsageCache) -> Set<String>
-        {
-            var cachePathsBySessionID: [String: [String]] = [:]
-            for (path, usage) in cache.files {
-                if let sessionID = usage.sessionId, !sessionID.isEmpty {
-                    cachePathsBySessionID[sessionID, default: []].append(path)
-                }
+        private func tokenHistoryPaths(for files: [URL], cache: CostUsageCache) -> Set<String> {
+            var pending = files.flatMap { self.pathsByKey[CostUsageScanner.codexPathKey($0)] ?? [] }
+            var visited: Set<String> = []
+            while let path = pending.popLast() {
+                guard visited.insert(path).inserted,
+                      let parentID = cache.files[path]?.forkedFromId,
+                      !parentID.isEmpty
+                else { continue }
+                pending.append(contentsOf: self.pathsBySessionID[parentID] ?? [])
             }
-            var pendingPaths = Array(selectedPaths)
-            var visitedPaths = Set<String>()
-            while let path = pendingPaths.popLast() {
-                guard visitedPaths.insert(path).inserted else { continue }
-                guard let parentID = cache.files[path]?.forkedFromId, !parentID.isEmpty else { continue }
-                pendingPaths.append(contentsOf: cachePathsBySessionID[parentID] ?? [])
-            }
-            return visitedPaths
-        }
-
-        private func hydrateUsage(
-            paths: Set<String>,
-            cache: inout CostUsageCache) -> Set<String>
-        {
-            let pathsToLoad = paths.intersection(self.unloadedUsagePaths)
-            guard !pathsToLoad.isEmpty else { return [] }
-            guard let rowsByPath = self.store.syncLoadCodexUsageRowsIfAvailable(paths: pathsToLoad)
-            else { return [] }
-            for path in pathsToLoad {
-                guard var usage = cache.files[path] else { continue }
-                let rows = (rowsByPath[path] ?? []).compactMap(CostUsageStore.usageRow(from:))
-                usage.codexRows = rows
-                usage.codexRowsAreUnloaded = nil
-                if usage.codexTurnIDs != nil || self.legacyTurnIDSummaryPaths.contains(path) {
-                    usage.codexTurnIDs = CostUsageScanner.codexTurnIDs(rows: rows)
-                    usage.codexTurnIDsAreUnloaded = nil
-                }
-                cache.files[path] = usage
-                self.unloadedUsagePaths.remove(path)
-            }
-            return pathsToLoad
-        }
-
-        private func selectedPaths(for files: [URL], cache: CostUsageCache) -> Set<String> {
-            guard !files.isEmpty else { return [] }
-            let selectedKeys = Set(files.map(CostUsageScanner.codexPathKey))
-            return Set(cache.files.keys.filter { path in
-                selectedKeys.contains(CostUsageScanner.codexPathKey(URL(fileURLWithPath: path)))
-            })
+            return visited
         }
     }
 
@@ -5671,12 +5656,17 @@ enum CostUsageScanner {
               !sourceCache.days.isEmpty
         else { return nil }
 
+        let priorityTurns = if plan.priorityValidationPending {
+            Self.validatedPriorityTurns(cache: sourceCache, calendar: range.calendar)
+        } else {
+            plan.priorityTurns
+        }
         let report = self.buildCodexReportFromCache(
             cache: sourceCache,
             range: range,
             modelsDevCatalog: plan.modelsDevCatalog,
             modelsDevCacheRoot: options.cacheRoot,
-            priorityTurns: plan.priorityTurns)
+            priorityTurns: priorityTurns)
         return CostUsageCodexPreviousReport(
             report: report,
             cache: sourceCache,
@@ -5718,7 +5708,6 @@ enum CostUsageScanner {
             requestedScanWindow: (sinceKey: range.scanSinceKey, untilKey: range.scanUntilKey),
             reportWindow: (sinceKey: range.sinceKey, untilKey: range.untilKey),
             unloadedTokenSnapshotPaths: history.unloadedTokenPaths,
-            unloadedUsageRowPaths: history.unloadedUsagePaths,
             skipIdenticalContent: true,
             receipt: receipt)
         if saveResult.catchUpRequired {
@@ -5739,14 +5728,43 @@ enum CostUsageScanner {
         var cache = loadedCache.cache
         let history = CodexScanHistoryHydrator(load: loadedCache)
         let nowMs = Int64(now.timeIntervalSince1970 * 1000)
-        let plan = Self.makeCodexRefreshPlan(cache: cache, range: range, now: now, nowMs: nowMs, options: options)
+        // A narrower report must finish the existing discovery cycle instead of restarting its queue.
+        // Keep pricing, file parsing, and inventory validation on that same retained work range.
+        let scanRange: CostUsageDayRange = if !options.forceRescan,
+                                              cache.timeZoneIdentifier == range.calendar.timeZone.identifier,
+                                              cache.scanUntilKey == range.scanUntilKey,
+                                              let pending = cache.codexActiveLookbackState,
+                                              pending.rootPaths == Self.codexSessionsRoots(options: options)
+                                                  .map(Self.codexResolvedPath).sorted()
+        {
+            range.retainingScanStart(pending.scanSinceKey)
+        } else {
+            range
+        }
+        let plan = Self.makeCodexRefreshPlan(cache: cache, range: scanRange, now: now, nowMs: nowMs, options: options)
         let previousReport = Self.codexPreviousReportCandidate(
             cache: cache,
             range: range,
             plan: plan,
             options: options)
 
+        // A transient trace-database failure must not make this refresh look complete. Keep the
+        // last published cache (including its freshness timestamp and durable priority cursor)
+        // untouched so the next refresh retries validation against the same baseline.
+        if plan.priorityValidationPending {
+            guard cache.roots == plan.rootsFingerprint,
+                  cache.timeZoneIdentifier == range.calendar.timeZone.identifier
+            else { return CostUsageDailyReport(data: [], summary: nil) }
+            return previousReport?.report ?? Self.buildCodexReportFromCache(
+                cache: cache,
+                range: range,
+                modelsDevCatalog: plan.modelsDevCatalog,
+                modelsDevCacheRoot: options.cacheRoot,
+                priorityTurns: Self.validatedPriorityTurns(cache: cache, calendar: range.calendar))
+        }
+
         if plan.shouldRefresh {
+            let range = scanRange
             try checkCancellation?()
             if options.forceRescan {
                 cache = CostUsageCache()
@@ -5905,7 +5923,8 @@ enum CostUsageScanner {
                     guard let usage = cache.files[fileURL.path], usage.codexScanComplete == true,
                           !usage.hasBufferedCodexForkRetryLines else { return true }
                     let metadata = Self.codexFileMetadata(fileURL: fileURL)
-                    return usage.size != metadata.size || usage.mtimeUnixMs != metadata.mtimeUnixMs
+                    return Self.codexLogicalTargetHasUnconsumedTail(metadata: metadata, cached: usage)
+                        || usage.size != metadata.size || usage.mtimeUnixMs != metadata.mtimeUnixMs
                         || usage.codexScanFileId != metadata.fileId
                 }
                 Self.appendCodexActiveLookbackPaths(
@@ -5959,11 +5978,6 @@ enum CostUsageScanner {
                     preferNewest: options.preferNewestCodexSessionsFirst,
                     workRecorder: options.codexScanWorkRecorderForTesting))
             let filesScheduledForRefresh = refreshSelection.files
-            if !plan.changedPriorityTurnIDs.isEmpty {
-                history.hydrateLegacyTurnIDSummaries(
-                    for: filesScheduledForRefresh,
-                    cache: &cache)
-            }
             let completionStatesBeforeScan = Self.codexCompletionStates(
                 files: filesScheduledForRefresh.prefix(Self.codexCatchUpScanCandidateLimit),
                 cache: cache,
@@ -6031,7 +6045,15 @@ enum CostUsageScanner {
                 attemptedPaths: scanResult.attemptedPaths,
                 processedPaths: scanResult.processedPaths,
                 cache: cache)
-            cache.codexActiveLookbackState = Self.finalizedCodexActiveLookbackState(
+            let completedScheduledTailFiles = filesScheduledForRefresh.filter { fileURL in
+                let resolvedPath = Self.codexResolvedPath(fileURL)
+                guard completedScheduledPaths.contains(resolvedPath),
+                      let usage = cache.files[fileURL.path]
+                else { return false }
+                let metadata = Self.codexFileMetadata(fileURL: fileURL)
+                return Self.codexLogicalTargetHasUnconsumedTail(metadata: metadata, cached: usage)
+            }
+            var finalizedLookbackState = Self.finalizedCodexActiveLookbackState(
                 activeLookbackState,
                 completedFilePaths: completedScheduledPaths,
                 servicedFilePaths: scanResult.processedPaths,
@@ -6039,6 +6061,11 @@ enum CostUsageScanner {
                 requiresBoundedDiscoveryCompletion: shouldPageDiscovery,
                 retainCompletedStateForExactValidation: scanBudget.hasTimeLimit && pendingLookbackPathCount > 0,
                 workRecorder: options.codexScanWorkRecorderForTesting)
+            if var state = finalizedLookbackState, !state.pendingFilePaths.isEmpty {
+                Self.appendCodexActiveLookbackPaths(completedScheduledTailFiles, state: &state)
+                finalizedLookbackState = state
+            }
+            cache.codexActiveLookbackState = finalizedLookbackState
             if scanBudget.resumedPartialFileCount > 0
                 || scanBudget.deferredByBudgetFileCount > 0
                 || scanBudget.deferredByTimeBudgetFileCount > 0
@@ -6152,6 +6179,17 @@ enum CostUsageScanner {
                 || cache.files.values.contains { $0.hasBufferedCodexForkRetryLines }
             cache.codexScanCatchUpPending = catchUpPending
             cache.codexPreviousReport = catchUpPending ? previousReport : nil
+            if plan.inspectedPriorityTurns {
+                // Report pricing follows each successful inspected window, including an empty
+                // historical result. The independent live cursor remains suitable for resume.
+                cache.codexResolvedPriorityTurns = Self.mergeResolvedPriorityTurns(
+                    existing: shouldRetainWiderWindow
+                        ? Self.validatedPriorityTurns(cache: cache, calendar: range.calendar) : [:],
+                    new: plan.priorityTurns,
+                    range: range,
+                    retainedSinceKey: retainedSinceKey,
+                    retainedUntilKey: retainedUntilKey)
+            }
             if plan.hasPriorityMetadata {
                 cache.codexPriorityTurnKeys = Self.mergePriorityTurnKeys(
                     existing: shouldRetainWiderWindow ? cache.codexPriorityTurnKeys : nil,
@@ -6316,6 +6354,43 @@ enum CostUsageScanner {
         }
     }
 
+    private static func completedCodexLogicalTargetSize(
+        metadata: CodexFileMetadata,
+        usage: CostUsageFileUsage) -> Int64?
+    {
+        let identityMatches = usage.codexScanFileId == nil || usage.codexScanFileId == metadata.fileId
+        guard usage.codexScanComplete != false,
+              usage.codexJSONLResumeState == nil,
+              !usage.hasBufferedCodexForkRetryLines,
+              identityMatches
+        else { return nil }
+        let parsedBytes = max(0, usage.parsedBytes ?? usage.size)
+        let targetSize = max(0, usage.codexScanTargetSize ?? usage.size)
+        guard targetSize <= usage.size,
+              targetSize <= metadata.size,
+              parsedBytes >= targetSize
+        else { return nil }
+
+        if usage.mtimeUnixMs == metadata.mtimeUnixMs, usage.size == metadata.size {
+            return targetSize
+        }
+        guard usage.codexScanFileId != nil,
+              usage.codexScanFileId == metadata.fileId,
+              usage.codexScanTargetSize != nil,
+              targetSize < metadata.size
+        else { return nil }
+        if targetSize == 0 {
+            return 0
+        }
+        guard usage.codexTokenIndexAnchor?.indexedBytes == targetSize else { return nil }
+        return usage.codexTokenIndexAnchor.map {
+            Self.codexTokenIndexAnchorMatches(
+                $0,
+                fileURL: URL(fileURLWithPath: metadata.path),
+                metadata: metadata)
+        } == true ? targetSize : nil
+    }
+
     private static func codexScanProgress(
         paths: Set<String>,
         cache: CostUsageCache,
@@ -6334,10 +6409,31 @@ enum CostUsageScanner {
             let identity = metadata.fileId ?? fileURL.standardizedFileURL.path
             guard seenIdentities.insert(identity).inserted else { continue }
             totalFiles += 1
-            totalBytes += max(0, metadata.size)
 
             let usage = cache.files[path] ?? cache.files[fileURL.standardizedFileURL.path]
-            guard let usage else { continue }
+            guard let usage else {
+                totalBytes += max(0, metadata.size)
+                continue
+            }
+            if let logicalTargetSize = Self.completedCodexLogicalTargetSize(
+                metadata: metadata,
+                usage: usage)
+            {
+                totalBytes += logicalTargetSize
+                processedBytes += logicalTargetSize
+                completedFiles += 1
+                continue
+            }
+            if let logicalTargetSize = Self.codexResumableScanTargetSize(
+                metadata: metadata,
+                cached: usage)
+            {
+                totalBytes += logicalTargetSize
+                processedBytes += min(logicalTargetSize, max(0, usage.parsedBytes ?? 0))
+                continue
+            }
+
+            totalBytes += max(0, metadata.size)
             let identityMatches = usage.codexScanFileId == nil || usage.codexScanFileId == metadata.fileId
             guard identityMatches,
                   usage.mtimeUnixMs == metadata.mtimeUnixMs,
@@ -6347,12 +6443,6 @@ enum CostUsageScanner {
                 max(0, metadata.size),
                 max(0, usage.parsedBytes ?? (usage.codexScanComplete == false ? 0 : usage.size)))
             processedBytes += parsedBytes
-            if usage.codexScanComplete != false,
-               parsedBytes >= metadata.size,
-               !usage.hasBufferedCodexForkRetryLines
-            {
-                completedFiles += 1
-            }
         }
 
         return CodexScanProgressSummary(
@@ -6488,7 +6578,6 @@ enum CostUsageScanner {
                 || plan.priorityMetadataChanged || plan.needsProjectMetadataMigration,
             dropDeferredCodexRows: options.forceRescan || plan.needsTurnIDCacheMigration,
             requiresTurnIDCache: plan.needsTurnIDCacheMigration,
-            pricingMetadataMigrationPathKeys: plan.pricingMetadataMigrationPathKeys,
             changedPriorityTurnIDs: plan.changedPriorityTurnIDs,
             resources: resources,
             checkCancellation: checkCancellation,
@@ -6517,22 +6606,30 @@ enum CostUsageScanner {
         metadata: CodexFileMetadata,
         cache: inout CostUsageCache,
         aliasIndex: CodexCachePathAliasIndex,
-        history: CodexScanHistoryHydrator) -> String?
+        history: CodexScanHistoryHydrator,
+        inheritedResolver: CodexInheritedTotalsResolver) -> String?
     {
         guard let fileID = metadata.fileId else { return nil }
         var aliases = aliasIndex.aliases(fileID: fileID, excludingPath: metadata.path)
         guard !aliases.isEmpty else { return nil }
 
         if cache.files[metadata.path] == nil, let migratedPath = aliases.first {
-            _ = history.hydrate(
+            let hydratedPaths = history.hydrate(
                 for: [URL(fileURLWithPath: migratedPath)],
                 cache: &cache)
+            for path in hydratedPaths {
+                inheritedResolver.updateCachedUsage(fileURL: URL(fileURLWithPath: path), usage: cache.files[path])
+            }
             guard history.isHydrated(
                 for: [URL(fileURLWithPath: migratedPath)],
                 cache: cache)
             else { return migratedPath }
             cache.files[metadata.path] = cache.files.removeValue(forKey: migratedPath)
-            history.moveHistory(from: migratedPath, to: metadata.path)
+            history.removeHistory(path: migratedPath)
+            history.update(path: metadata.path, usage: cache.files[metadata.path])
+            inheritedResolver.updateCachedUsage(fileURL: URL(fileURLWithPath: migratedPath), usage: nil)
+            inheritedResolver.updateCachedUsage(
+                fileURL: URL(fileURLWithPath: metadata.path), usage: cache.files[metadata.path])
             aliasIndex.remove(path: migratedPath)
             aliasIndex.update(path: metadata.path, fileID: fileID)
             aliases.removeFirst()

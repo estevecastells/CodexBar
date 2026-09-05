@@ -45,6 +45,7 @@
 "hooks_any_provider" = "Любой провайдер";
 "hooks_threshold" = "Запускать при использовании ≥";
 "hooks_threshold_placeholder" = "90";
+"hooks_executable" = "Исполняемый файл";
 "hooks_executable_placeholder" = "/usr/local/bin/my-command";
 "hooks_arguments_placeholder" = "Аргументы";
 "hooks_argument_placeholder" = "Аргумент";
@@ -1487,6 +1488,7 @@
 "Total usage" = "Общее использование";
 "claude_oauth_keychain_access_revoked" = "Доступ к Связке ключей Claude был отозван из-за ротации токена в Claude Code. Нажмите «Обновить», чтобы повторно предоставить доступ, или переключите источник использования Claude на CLI/Web.";
 "claude_showing_last_known_usage" = "Показаны последние известные данные об использовании (получены %@).";
+"claude_limited_usage_detail" = "Ограниченная детализация использования";
 /* Spend dashboard cost analysis */
 "90d" = "90d";
 "Input" = "Input";
