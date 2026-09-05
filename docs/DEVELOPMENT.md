@@ -266,8 +266,10 @@ Retention that rewrites identical metadata requires a fresh locked semantic comp
 without a receipt read a fresh baseline at save and cannot establish freshness back to an earlier load.
 
 `CostUsageStoreReadWorkTests` counts full load/save cycles: an uncontended unchanged receipt cycle reads
-one full snapshot and decodes each usage row once, with one freshness write and no aggregate grouping
-visits. Synthetic interleavings cover writer races, mutations, retention, replacement and receipt lifetime.
+one scanner snapshot and decodes each exact usage row once, without reading raw token snapshots, with
+one freshness write and no aggregate grouping visits. Changed files and fork ancestors hydrate token
+history through the original receipt, validating its stamp after the read transaction commits. Synthetic
+interleavings cover writer races, mutations, retention, replacement and receipt lifetime.
 Initial decoding, semantic equality, filesystem reconciliation, report generation and priority aggregation
 still cost work proportional to retained history. These counters do not measure installed-app idle CPU;
 refresh cadence, scan budgets, timestamp parsing and incremental-order validation are unchanged.
